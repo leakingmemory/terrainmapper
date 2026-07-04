@@ -3,6 +3,7 @@
 
 #include <wx/filedlg.h>
 #include <wx/filename.h>
+#include <wx/progdlg.h>
 
 #include <zip.h>
 
@@ -87,13 +88,34 @@ void MainFrame::LoadZip(const wxString& path)
 
     zip_int64_t n = zip_get_num_entries(z, 0);
 
+    wxProgressDialog progress(
+        "Loading ZIP",
+        "Reading archive contents...",
+        static_cast<int>(n),
+        this,
+        wxPD_AUTO_HIDE | wxPD_APP_MODAL | wxPD_SMOOTH |
+        wxPD_CAN_ABORT | wxPD_ELAPSED_TIME | wxPD_ESTIMATED_TIME);
+
+    bool cancelled = false;
     for (zip_int64_t i = 0; i < n; i++) {
         zip_stat_t st;
         zip_stat_init(&st);
         if (zip_stat_index(z, i, 0, &st) != 0)
             continue;
 
-        long row = m_list->InsertItem(i, wxString::FromUTF8(st.name));
+        // Extract a short display name for the progress message
+        wxString entryName = wxString::FromUTF8(st.name);
+        wxString shortName = wxFileName(entryName).GetFullName();
+        if (!progress.Update(
+                static_cast<int>(i),
+                wxString::Format("Reading tile %lld/%lld: %s",
+                                 (long long)(i + 1), (long long)n,
+                                 shortName))) {
+            cancelled = true;
+            break;
+        }
+
+        long row = m_list->InsertItem(i, entryName);
 
         if (st.valid & ZIP_STAT_SIZE)
             m_list->SetItem(row, 1,
@@ -125,6 +147,14 @@ void MainFrame::LoadZip(const wxString& path)
     }
 
     zip_close(z);
+
+    if (cancelled) {
+        m_list->DeleteAllItems();
+        m_currentZipPath.clear();
+        SetStatusText("Loading cancelled");
+        SetTitle("TerrainMapper");
+        return;
+    }
 
     SetTitle(wxString::Format("TerrainMapper \u2014 %s",
                               wxFileName(path).GetFullName()));
