@@ -2,16 +2,19 @@
 
 #include <wx/wx.h>
 #include <wx/scrolwin.h>
+#include <wx/progdlg.h>
 
 #include <ogr_spatialref.h>
 
+#include <cstdint>
 #include <string>
 #include <vector>
 
 class MapView : public wxFrame {
 public:
     MapView(wxWindow* parent, const wxString& title,
-            const std::string& vsiPath);
+            const std::string& vsiPath,
+            const std::string& ar50Path = "");
     ~MapView();
 
 private:
@@ -22,6 +25,11 @@ private:
     bool m_hasNodata = false;
     double m_gt[6] = {};
     float m_minElev = 0, m_maxElev = 0;
+    std::string m_tileProjectionWkt;
+
+    // Land cover (artype per pixel, 0 = unknown)
+    std::vector<int32_t> m_landcover;
+    bool m_hasLandcover = false;
 
     // Display
     wxScrolledCanvas* m_canvas = nullptr;
@@ -31,11 +39,15 @@ private:
     OGRCoordinateTransformation* m_toWGS84 = nullptr;
 
     bool LoadTile(const std::string& vsiPath);
+    bool LoadLandCover(const std::string& ar50Path,
+                       wxProgressDialog* progress = nullptr);
     wxImage RenderElevation() const;
 
     void OnPaint(wxPaintEvent& event);
     void OnMouseMove(wxMouseEvent& event);
 
     struct RGB { unsigned char r, g, b; };
-    RGB ElevToColor(float elev) const;
+    RGB ElevToColor(float elev, int32_t artype) const;
+    static RGB LandCoverColor(int32_t artype);
+    static const char* LandCoverName(int32_t artype);
 };

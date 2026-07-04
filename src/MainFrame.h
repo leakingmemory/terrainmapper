@@ -15,6 +15,7 @@ struct TileBounds {
 class MainFrame : public wxFrame {
 public:
     MainFrame();
+    ~MainFrame();
 
     // Build a GDAL nested-vsizip path from an outer zip and an entry name.
     // Returns empty string if the entry name doesn't match the DTM naming pattern.
@@ -24,8 +25,13 @@ public:
 private:
     wxListCtrl* m_list;
     std::vector<std::string> m_zipPaths;
+    std::string m_ar50Path;     // path to the AR50 .gdb (on disk)
+    std::string m_ar50TempDir;  // temp directory to clean up
+
+    void CleanupAr50Temp();
 
     void OnOpenZip(wxCommandEvent& event);
+    void OnLoadLandCover(wxCommandEvent& event);
     void OnCloseAll(wxCommandEvent& event);
     void OnExit(wxCommandEvent& event);
     void OnAbout(wxCommandEvent& event);

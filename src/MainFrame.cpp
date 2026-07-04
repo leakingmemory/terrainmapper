@@ -9,20 +9,23 @@
 
 #include <gdal_priv.h>
 #include <ogr_spatialref.h>
+#include <cpl_vsi.h>
 
 #include <ctime>
 #include <regex>
 
 enum {
     ID_OpenZip = wxID_HIGHEST + 1,
+    ID_LoadLandCover,
     ID_CloseAll
 };
 
 wxBEGIN_EVENT_TABLE(MainFrame, wxFrame)
-    EVT_MENU(ID_OpenZip,  MainFrame::OnOpenZip)
-    EVT_MENU(ID_CloseAll, MainFrame::OnCloseAll)
-    EVT_MENU(wxID_EXIT,   MainFrame::OnExit)
-    EVT_MENU(wxID_ABOUT,  MainFrame::OnAbout)
+    EVT_MENU(ID_OpenZip,       MainFrame::OnOpenZip)
+    EVT_MENU(ID_LoadLandCover, MainFrame::OnLoadLandCover)
+    EVT_MENU(ID_CloseAll,      MainFrame::OnCloseAll)
+    EVT_MENU(wxID_EXIT,        MainFrame::OnExit)
+    EVT_MENU(wxID_ABOUT,       MainFrame::OnAbout)
     EVT_LIST_ITEM_ACTIVATED(wxID_ANY, MainFrame::OnTileActivated)
 wxEND_EVENT_TABLE()
 
@@ -34,6 +37,7 @@ MainFrame::MainFrame()
     // Menu bar
     auto* fileMenu = new wxMenu;
     fileMenu->Append(ID_OpenZip, "&Open ZIP...\tCtrl+O", "Open one or more ZIP archives");
+    fileMenu->Append(ID_LoadLandCover, "Load &Land Cover...", "Load an AR50 land cover dataset (.gdb in .zip)");
     fileMenu->Append(ID_CloseAll, "&Close All\tCtrl+W", "Remove all loaded tiles");
     fileMenu->AppendSeparator();
     fileMenu->Append(wxID_EXIT, "E&xit\tAlt+F4");
@@ -76,6 +80,173 @@ void MainFrame::OnOpenZip(wxCommandEvent&)
         LoadZip(p);
 }
 
+void MainFrame::OnLoadLandCover(wxCommandEvent&)
+{
+    wxFileDialog dlg(this, "Load AR50 Land Cover", wxEmptyString, wxEmptyString,
+                     "ZIP files (*.zip)|*.zip|All files (*)|*",
+                     wxFD_OPEN | wxFD_FILE_MUST_EXIST);
+    if (dlg.ShowModal() == wxID_CANCEL)
+        return;
+
+    const std::string zipPath = dlg.GetPath().ToStdString();
+
+    // Open the zip with libzip to find and extract the .gdb
+    int err = 0;
+    zip_t* z = zip_open(zipPath.c_str(), ZIP_RDONLY, &err);
+    if (!z) {
+        wxMessageBox("Could not open ZIP file.", "Error",
+                     wxICON_ERROR | wxOK, this);
+        return;
+    }
+
+    // Find the .gdb directory prefix and collect its entries
+    std::string gdbPrefix;
+    struct GdbEntry { zip_uint64_t index; std::string name; zip_uint64_t size; };
+    std::vector<GdbEntry> gdbEntries;
+    zip_uint64_t totalBytes = 0;
+
+    zip_int64_t n = zip_get_num_entries(z, 0);
+    for (zip_int64_t i = 0; i < n; i++) {
+        zip_stat_t st;
+        zip_stat_init(&st);
+        if (zip_stat_index(z, i, 0, &st) != 0)
+            continue;
+        std::string name = st.name;
+
+        // Find the .gdb/ prefix
+        if (gdbPrefix.empty()) {
+            auto pos = name.find(".gdb/");
+            if (pos != std::string::npos)
+                gdbPrefix = name.substr(0, pos + 5);
+        }
+
+        if (!gdbPrefix.empty() && name.starts_with(gdbPrefix) && name != gdbPrefix) {
+            gdbEntries.push_back({static_cast<zip_uint64_t>(i), name,
+                                  (st.valid & ZIP_STAT_SIZE) ? st.size : 0});
+            totalBytes += (st.valid & ZIP_STAT_SIZE) ? st.size : 0;
+        }
+    }
+
+    if (gdbPrefix.empty() || gdbEntries.empty()) {
+        wxMessageBox("No .gdb directory found inside the ZIP.", "Error",
+                     wxICON_ERROR | wxOK, this);
+        zip_close(z);
+        return;
+    }
+
+    // Create temp directory for extraction
+    CleanupAr50Temp();
+
+    wxString tempBase = wxFileName::GetTempDir() + wxFileName::GetPathSeparator()
+                        + "terrainmapper_ar50_XXXXXX";
+    std::string tempTemplate = tempBase.ToStdString();
+    char* tempDir = mkdtemp(tempTemplate.data());
+    if (!tempDir) {
+        wxMessageBox("Could not create temporary directory.", "Error",
+                     wxICON_ERROR | wxOK, this);
+        zip_close(z);
+        return;
+    }
+    m_ar50TempDir = tempDir;
+
+    // The .gdb directory name (strip trailing slash from prefix)
+    std::string gdbDirName = gdbPrefix.substr(0, gdbPrefix.size() - 1);
+    // Remove any leading path components (e.g. if prefix is "subdir/foo.gdb/")
+    auto slashPos = gdbDirName.rfind('/');
+    if (slashPos != std::string::npos)
+        gdbDirName = gdbDirName.substr(slashPos + 1);
+
+    const std::string gdbDiskPath = m_ar50TempDir + "/" + gdbDirName;
+    wxFileName::Mkdir(gdbDiskPath);
+
+    // Extract files with progress
+    wxProgressDialog progress(
+        "Extracting Land Cover",
+        "Extracting geodatabase...",
+        100, this,
+        wxPD_AUTO_HIDE | wxPD_APP_MODAL | wxPD_SMOOTH |
+        wxPD_ELAPSED_TIME | wxPD_ESTIMATED_TIME);
+
+    zip_uint64_t bytesExtracted = 0;
+    bool extractOk = true;
+    std::vector<char> buf(256 * 1024);
+
+    for (const auto& entry : gdbEntries) {
+        // Get just the filename within the .gdb directory
+        std::string relName = entry.name.substr(gdbPrefix.size());
+        std::string outPath = gdbDiskPath + "/" + relName;
+
+        progress.Update(
+            totalBytes ? static_cast<int>(bytesExtracted * 95 / totalBytes) : 0,
+            wxString::Format("Extracting %s...", relName));
+
+        zip_file_t* zf = zip_fopen_index(z, entry.index, 0);
+        if (!zf) { extractOk = false; break; }
+
+        FILE* fp = fopen(outPath.c_str(), "wb");
+        if (!fp) { zip_fclose(zf); extractOk = false; break; }
+
+        zip_int64_t nread;
+        while ((nread = zip_fread(zf, buf.data(), buf.size())) > 0) {
+            fwrite(buf.data(), 1, static_cast<size_t>(nread), fp);
+            bytesExtracted += nread;
+            if (totalBytes > 0)
+                progress.Update(static_cast<int>(bytesExtracted * 95 / totalBytes));
+        }
+        fclose(fp);
+        zip_fclose(zf);
+    }
+
+    zip_close(z);
+
+    if (!extractOk) {
+        wxMessageBox("Failed to extract geodatabase files.", "Error",
+                     wxICON_ERROR | wxOK, this);
+        CleanupAr50Temp();
+        return;
+    }
+
+    // Verify the extracted .gdb opens correctly
+    progress.Update(96, "Verifying dataset...");
+    GDALDataset* ds = static_cast<GDALDataset*>(
+        GDALOpenEx(gdbDiskPath.c_str(), GDAL_OF_VECTOR | GDAL_OF_READONLY,
+                   nullptr, nullptr, nullptr));
+    if (!ds) {
+        wxMessageBox("Could not open the extracted geodatabase.", "Error",
+                     wxICON_ERROR | wxOK, this);
+        CleanupAr50Temp();
+        return;
+    }
+    OGRLayer* layer = ds->GetLayerByName("ar50");
+    if (!layer) {
+        wxMessageBox("No 'ar50' layer found in the geodatabase.", "Error",
+                     wxICON_ERROR | wxOK, this);
+        GDALClose(ds);
+        CleanupAr50Temp();
+        return;
+    }
+    GDALClose(ds);
+
+    progress.Update(100);
+    m_ar50Path = gdbDiskPath;
+    SetStatusText(wxString::Format("Land cover ready: %s (%zu files extracted)",
+                                   gdbDirName, gdbEntries.size()));
+}
+
+void MainFrame::CleanupAr50Temp()
+{
+    if (m_ar50TempDir.empty())
+        return;
+    wxFileName::Rmdir(m_ar50TempDir, wxPATH_RMDIR_RECURSIVE);
+    m_ar50TempDir.clear();
+    m_ar50Path.clear();
+}
+
+MainFrame::~MainFrame()
+{
+    CleanupAr50Temp();
+}
+
 void MainFrame::LoadZip(const wxString& path)
 {
     int err = 0;
@@ -90,7 +261,6 @@ void MainFrame::LoadZip(const wxString& path)
         return;
     }
 
-    // Register this zip and record its index for item data
     const std::string zipPath = path.ToStdString();
     const long zipIndex = static_cast<long>(m_zipPaths.size());
     m_zipPaths.push_back(zipPath);
@@ -160,7 +330,6 @@ void MainFrame::LoadZip(const wxString& path)
     zip_close(z);
 
     if (cancelled) {
-        // Remove only the rows added during this (partial) load
         for (long r = m_list->GetItemCount() - 1; r >= startRow; --r)
             m_list->DeleteItem(r);
         m_zipPaths.pop_back();
@@ -194,12 +363,11 @@ void MainFrame::OnCloseAll(wxCommandEvent&)
 {
     m_list->DeleteAllItems();
     m_zipPaths.clear();
+    CleanupAr50Temp();
     UpdateTitleAndStatus();
 }
 
 // Static helper: build a GDAL nested-vsizip path from the entry name.
-// Entry names follow:  .../Basisdata_XXYY-Q_Celle_EPSG_DTM10UTMZZ_TIFF.zip
-// Inner tif:           XXYY_Q_10m_zZZ.tif
 std::string MainFrame::BuildTileVsiPath(const std::string& outerZipPath,
                                          const std::string& entryName)
 {
@@ -289,14 +457,13 @@ void MainFrame::OnTileActivated(wxListEvent& event)
         return;
     }
 
-    // Extract sheet for the window title
     static const std::regex sheetRe(R"(Basisdata_(\d+-\d+)_)");
     std::smatch m;
     wxString title = "Tile";
     if (std::regex_search(entryName, m, sheetRe))
         title = wxString::Format("Tile %s", m[1].str());
 
-    auto* view = new MapView(nullptr, title, vsiPath);
+    auto* view = new MapView(nullptr, title, vsiPath, m_ar50Path);
     view->Show();
 }
 
