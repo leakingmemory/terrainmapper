@@ -5,6 +5,7 @@
 
 #include <optional>
 #include <string>
+#include <vector>
 
 struct TileBounds {
     double latMin, latMax;
@@ -22,14 +23,16 @@ public:
 
 private:
     wxListCtrl* m_list;
-    std::string m_currentZipPath;
+    std::vector<std::string> m_zipPaths;
 
     void OnOpenZip(wxCommandEvent& event);
+    void OnCloseAll(wxCommandEvent& event);
     void OnExit(wxCommandEvent& event);
     void OnAbout(wxCommandEvent& event);
     void OnTileActivated(wxListEvent& event);
 
     void LoadZip(const wxString& path);
+    void UpdateTitleAndStatus();
 
     std::optional<TileBounds> GetTileBounds(const std::string& outerZipPath,
                                             const std::string& entryName);

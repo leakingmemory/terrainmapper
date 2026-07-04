@@ -14,13 +14,15 @@
 #include <regex>
 
 enum {
-    ID_OpenZip = wxID_HIGHEST + 1
+    ID_OpenZip = wxID_HIGHEST + 1,
+    ID_CloseAll
 };
 
 wxBEGIN_EVENT_TABLE(MainFrame, wxFrame)
-    EVT_MENU(ID_OpenZip, MainFrame::OnOpenZip)
-    EVT_MENU(wxID_EXIT,  MainFrame::OnExit)
-    EVT_MENU(wxID_ABOUT, MainFrame::OnAbout)
+    EVT_MENU(ID_OpenZip,  MainFrame::OnOpenZip)
+    EVT_MENU(ID_CloseAll, MainFrame::OnCloseAll)
+    EVT_MENU(wxID_EXIT,   MainFrame::OnExit)
+    EVT_MENU(wxID_ABOUT,  MainFrame::OnAbout)
     EVT_LIST_ITEM_ACTIVATED(wxID_ANY, MainFrame::OnTileActivated)
 wxEND_EVENT_TABLE()
 
@@ -31,7 +33,8 @@ MainFrame::MainFrame()
 
     // Menu bar
     auto* fileMenu = new wxMenu;
-    fileMenu->Append(ID_OpenZip, "&Open ZIP...\tCtrl+O", "Open a ZIP archive");
+    fileMenu->Append(ID_OpenZip, "&Open ZIP...\tCtrl+O", "Open one or more ZIP archives");
+    fileMenu->Append(ID_CloseAll, "&Close All\tCtrl+W", "Remove all loaded tiles");
     fileMenu->AppendSeparator();
     fileMenu->Append(wxID_EXIT, "E&xit\tAlt+F4");
 
@@ -61,12 +64,16 @@ MainFrame::MainFrame()
 
 void MainFrame::OnOpenZip(wxCommandEvent&)
 {
-    wxFileDialog dlg(this, "Open ZIP file", wxEmptyString, wxEmptyString,
+    wxFileDialog dlg(this, "Open ZIP files", wxEmptyString, wxEmptyString,
                      "ZIP files (*.zip)|*.zip|All files (*)|*",
-                     wxFD_OPEN | wxFD_FILE_MUST_EXIST);
+                     wxFD_OPEN | wxFD_FILE_MUST_EXIST | wxFD_MULTIPLE);
     if (dlg.ShowModal() == wxID_CANCEL)
         return;
-    LoadZip(dlg.GetPath());
+
+    wxArrayString paths;
+    dlg.GetPaths(paths);
+    for (const auto& p : paths)
+        LoadZip(p);
 }
 
 void MainFrame::LoadZip(const wxString& path)
@@ -83,8 +90,12 @@ void MainFrame::LoadZip(const wxString& path)
         return;
     }
 
-    m_currentZipPath = path.ToStdString();
-    m_list->DeleteAllItems();
+    // Register this zip and record its index for item data
+    const std::string zipPath = path.ToStdString();
+    const long zipIndex = static_cast<long>(m_zipPaths.size());
+    m_zipPaths.push_back(zipPath);
+
+    const long startRow = m_list->GetItemCount();
 
     zip_int64_t n = zip_get_num_entries(z, 0);
 
@@ -103,7 +114,6 @@ void MainFrame::LoadZip(const wxString& path)
         if (zip_stat_index(z, i, 0, &st) != 0)
             continue;
 
-        // Extract a short display name for the progress message
         wxString entryName = wxString::FromUTF8(st.name);
         wxString shortName = wxFileName(entryName).GetFullName();
         if (!progress.Update(
@@ -115,7 +125,8 @@ void MainFrame::LoadZip(const wxString& path)
             break;
         }
 
-        long row = m_list->InsertItem(i, entryName);
+        long row = m_list->InsertItem(m_list->GetItemCount(), entryName);
+        m_list->SetItemData(row, zipIndex);
 
         if (st.valid & ZIP_STAT_SIZE)
             m_list->SetItem(row, 1,
@@ -130,7 +141,7 @@ void MainFrame::LoadZip(const wxString& path)
             m_list->SetItem(row, 3, buf);
         }
 
-        auto bounds = GetTileBounds(m_currentZipPath, st.name);
+        auto bounds = GetTileBounds(zipPath, st.name);
         if (bounds) {
             static const std::regex sheetRe(R"(Basisdata_(\d+-\d+)_)");
             std::cmatch m;
@@ -149,16 +160,41 @@ void MainFrame::LoadZip(const wxString& path)
     zip_close(z);
 
     if (cancelled) {
-        m_list->DeleteAllItems();
-        m_currentZipPath.clear();
+        // Remove only the rows added during this (partial) load
+        for (long r = m_list->GetItemCount() - 1; r >= startRow; --r)
+            m_list->DeleteItem(r);
+        m_zipPaths.pop_back();
         SetStatusText("Loading cancelled");
-        SetTitle("TerrainMapper");
-        return;
     }
 
-    SetTitle(wxString::Format("TerrainMapper \u2014 %s",
-                              wxFileName(path).GetFullName()));
-    SetStatusText(wxString::Format("%s  (%lld entries)", path, (long long)n));
+    UpdateTitleAndStatus();
+}
+
+void MainFrame::UpdateTitleAndStatus()
+{
+    const long totalItems = m_list->GetItemCount();
+    const size_t numZips = m_zipPaths.size();
+
+    if (numZips == 0) {
+        SetTitle("TerrainMapper");
+        SetStatusText("Ready \u2014 use File > Open ZIP to load an archive");
+    } else if (numZips == 1) {
+        SetTitle(wxString::Format("TerrainMapper \u2014 %s",
+                 wxFileName(m_zipPaths[0]).GetFullName()));
+        SetStatusText(wxString::Format("%ld tiles", totalItems));
+    } else {
+        SetTitle(wxString::Format("TerrainMapper \u2014 %zu zips, %ld tiles",
+                                  numZips, totalItems));
+        SetStatusText(wxString::Format("%zu archives loaded, %ld tiles total",
+                                       numZips, totalItems));
+    }
+}
+
+void MainFrame::OnCloseAll(wxCommandEvent&)
+{
+    m_list->DeleteAllItems();
+    m_zipPaths.clear();
+    UpdateTitleAndStatus();
 }
 
 // Static helper: build a GDAL nested-vsizip path from the entry name.
@@ -233,7 +269,11 @@ std::optional<TileBounds> MainFrame::GetTileBounds(const std::string& outerZipPa
 
 void MainFrame::OnTileActivated(wxListEvent& event)
 {
-    if (m_currentZipPath.empty())
+    if (m_zipPaths.empty())
+        return;
+
+    const long zipIndex = m_list->GetItemData(event.GetIndex());
+    if (zipIndex < 0 || static_cast<size_t>(zipIndex) >= m_zipPaths.size())
         return;
 
     wxListItem item;
@@ -243,7 +283,7 @@ void MainFrame::OnTileActivated(wxListEvent& event)
     m_list->GetItem(item);
     const std::string entryName = item.GetText().ToStdString();
 
-    const std::string vsiPath = BuildTileVsiPath(m_currentZipPath, entryName);
+    const std::string vsiPath = BuildTileVsiPath(m_zipPaths[zipIndex], entryName);
     if (vsiPath.empty()) {
         SetStatusText("Not a recognized DTM tile");
         return;
