@@ -8,21 +8,24 @@
 #include <zip.h>
 
 #include <gdal_priv.h>
-#include <ogr_spatialref.h>
+#include <ogrsf_frmts.h>
 #include <cpl_vsi.h>
 
 #include <ctime>
+#include <functional>
 #include <regex>
 
 enum {
     ID_OpenZip = wxID_HIGHEST + 1,
     ID_LoadLandCover,
+    ID_LoadTransport,
     ID_CloseAll
 };
 
 wxBEGIN_EVENT_TABLE(MainFrame, wxFrame)
     EVT_MENU(ID_OpenZip,       MainFrame::OnOpenZip)
     EVT_MENU(ID_LoadLandCover, MainFrame::OnLoadLandCover)
+    EVT_MENU(ID_LoadTransport, MainFrame::OnLoadTransport)
     EVT_MENU(ID_CloseAll,      MainFrame::OnCloseAll)
     EVT_MENU(wxID_EXIT,        MainFrame::OnExit)
     EVT_MENU(wxID_ABOUT,       MainFrame::OnAbout)
@@ -38,6 +41,7 @@ MainFrame::MainFrame()
     auto* fileMenu = new wxMenu;
     fileMenu->Append(ID_OpenZip, "&Open ZIP...\tCtrl+O", "Open one or more ZIP archives");
     fileMenu->Append(ID_LoadLandCover, "Load &Land Cover...", "Load an AR50 land cover dataset (.gdb in .zip)");
+    fileMenu->Append(ID_LoadTransport, "Load &Transport Data...", "Load railway network (.gdb in .zip)");
     fileMenu->Append(ID_CloseAll, "&Close All\tCtrl+W", "Remove all loaded tiles");
     fileMenu->AppendSeparator();
     fileMenu->Append(wxID_EXIT, "E&xit\tAlt+F4");
@@ -240,6 +244,90 @@ void MainFrame::CleanupAr50Temp()
     wxFileName::Rmdir(m_ar50TempDir, wxPATH_RMDIR_RECURSIVE);
     m_ar50TempDir.clear();
     m_ar50Path.clear();
+}
+
+void MainFrame::OnLoadTransport(wxCommandEvent&)
+{
+    wxFileDialog dlg(this, "Load Transport Data", wxEmptyString, wxEmptyString,
+                     "ZIP files (*.zip)|*.zip|All files (*)|*",
+                     wxFD_OPEN | wxFD_FILE_MUST_EXIST);
+    if (dlg.ShowModal() == wxID_CANCEL)
+        return;
+
+    const std::string zipPath = dlg.GetPath().ToStdString();
+
+    // Recursively scan the outer zip for an inner zip containing a railway .gdb
+    const std::string outerVsi = "/vsizip/" + zipPath;
+
+    // Collect all entries recursively (zip is small, max depth 3)
+    std::string railwayVsiPath;
+    std::function<void(const std::string&, int)> scanDir =
+        [&](const std::string& dir, int depth) {
+        if (depth > 4 || !railwayVsiPath.empty())
+            return;
+        char** entries = VSIReadDir(dir.c_str());
+        if (!entries)
+            return;
+        for (int i = 0; entries[i] && railwayVsiPath.empty(); i++) {
+            std::string name = entries[i];
+            if (name.find("Banenettverk") != std::string::npos &&
+                name.size() >= 4 &&
+                name.substr(name.size() - 4) == ".zip") {
+                // Found the inner railway zip — look for .gdb inside
+                std::string innerVsi = "/vsizip/" + dir + "/" + name;
+                char** gdbEntries = VSIReadDir(innerVsi.c_str());
+                if (gdbEntries) {
+                    for (int k = 0; gdbEntries[k]; k++) {
+                        std::string gdbName = gdbEntries[k];
+                        if (gdbName.size() >= 4 &&
+                            gdbName.substr(gdbName.size() - 4) == ".gdb") {
+                            railwayVsiPath = innerVsi + "/" + gdbName;
+                            break;
+                        }
+                    }
+                    CSLDestroy(gdbEntries);
+                }
+            } else {
+                // Recurse into subdirectory
+                scanDir(dir + "/" + name, depth + 1);
+            }
+        }
+        CSLDestroy(entries);
+    };
+    scanDir(outerVsi, 0);
+
+    if (railwayVsiPath.empty()) {
+        wxMessageBox("No railway geodatabase found in the ZIP.\n"
+                     "Expected a nested zip containing '*Banenettverk*.gdb'.",
+                     "Error", wxICON_ERROR | wxOK, this);
+        return;
+    }
+
+    // Verify the .gdb opens and has the expected layers
+    GDALDataset* ds = static_cast<GDALDataset*>(
+        GDALOpenEx(railwayVsiPath.c_str(), GDAL_OF_VECTOR | GDAL_OF_READONLY,
+                   nullptr, nullptr, nullptr));
+    if (!ds) {
+        wxMessageBox("Could not open the railway geodatabase.", "Error",
+                     wxICON_ERROR | wxOK, this);
+        return;
+    }
+
+    OGRLayer* tracks = ds->GetLayerByName("Banelenke");
+    OGRLayer* stations = ds->GetLayerByName("Stasjonsnode");
+    int trackCount = tracks ? static_cast<int>(tracks->GetFeatureCount()) : 0;
+    int stationCount = stations ? static_cast<int>(stations->GetFeatureCount()) : 0;
+    GDALClose(ds);
+
+    if (!tracks && !stations) {
+        wxMessageBox("No railway layers found (expected Banelenke/Stasjonsnode).",
+                     "Error", wxICON_ERROR | wxOK, this);
+        return;
+    }
+
+    m_railwayPath = railwayVsiPath;
+    SetStatusText(wxString::Format("Railway data loaded: %d track segments, %d stations",
+                                   trackCount, stationCount));
 }
 
 MainFrame::~MainFrame()
@@ -463,7 +551,7 @@ void MainFrame::OnTileActivated(wxListEvent& event)
     if (std::regex_search(entryName, m, sheetRe))
         title = wxString::Format("Tile %s", m[1].str());
 
-    auto* view = new MapView(nullptr, title, vsiPath, m_ar50Path);
+    auto* view = new MapView(nullptr, title, vsiPath, m_ar50Path, m_railwayPath);
     view->Show();
 }
 

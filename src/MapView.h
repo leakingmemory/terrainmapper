@@ -14,7 +14,8 @@ class MapView : public wxFrame {
 public:
     MapView(wxWindow* parent, const wxString& title,
             const std::string& vsiPath,
-            const std::string& ar50Path = "");
+            const std::string& ar50Path = "",
+            const std::string& railwayPath = "");
     ~MapView();
 
 private:
@@ -31,6 +32,20 @@ private:
     std::vector<int32_t> m_landcover;
     bool m_hasLandcover = false;
 
+    // Railway overlay
+    struct RailwaySegment {
+        std::vector<wxPoint> points;
+        std::string name;
+    };
+    struct RailwayStation {
+        wxPoint pos;
+        std::string name;
+        bool active = true;  // based on Jernbanestatus
+    };
+    std::vector<RailwaySegment> m_railSegments;
+    std::vector<RailwayStation> m_railStations;
+    bool m_hasRailway = false;
+
     // Display
     wxScrolledCanvas* m_canvas = nullptr;
     wxBitmap m_bitmap;
@@ -38,9 +53,13 @@ private:
     // Coordinate transform (tile SRS → WGS84), owned
     OGRCoordinateTransformation* m_toWGS84 = nullptr;
 
+    // Inverse geotransform for coordinate → pixel conversion
+    double m_invGt[6] = {};
+
     bool LoadTile(const std::string& vsiPath);
     bool LoadLandCover(const std::string& ar50Path,
                        wxProgressDialog* progress = nullptr);
+    bool LoadRailway(const std::string& railwayPath);
     wxImage RenderElevation() const;
 
     void OnPaint(wxPaintEvent& event);

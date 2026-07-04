@@ -25,13 +25,15 @@ public:
 private:
     wxListCtrl* m_list;
     std::vector<std::string> m_zipPaths;
-    std::string m_ar50Path;     // path to the AR50 .gdb (on disk)
-    std::string m_ar50TempDir;  // temp directory to clean up
+    std::string m_ar50Path;       // path to the AR50 .gdb (on disk)
+    std::string m_ar50TempDir;    // temp directory to clean up
+    std::string m_railwayPath;    // vsizip path to railway .gdb
 
     void CleanupAr50Temp();
 
     void OnOpenZip(wxCommandEvent& event);
     void OnLoadLandCover(wxCommandEvent& event);
+    void OnLoadTransport(wxCommandEvent& event);
     void OnCloseAll(wxCommandEvent& event);
     void OnExit(wxCommandEvent& event);
     void OnAbout(wxCommandEvent& event);

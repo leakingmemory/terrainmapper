@@ -13,7 +13,8 @@
 
 MapView::MapView(wxWindow* parent, const wxString& title,
                  const std::string& vsiPath,
-                 const std::string& ar50Path)
+                 const std::string& ar50Path,
+                 const std::string& railwayPath)
     : wxFrame(parent, wxID_ANY, title, wxDefaultPosition, wxSize(900, 700))
 {
     m_canvas = new wxScrolledCanvas(this, wxID_ANY);
@@ -34,6 +35,9 @@ MapView::MapView(wxWindow* parent, const wxString& title,
         progress.Update(10, "Loading land cover...");
         if (!ar50Path.empty())
             LoadLandCover(ar50Path, &progress);
+        progress.Update(88, "Loading railway data...");
+        if (!railwayPath.empty())
+            LoadRailway(railwayPath);
         progress.Update(90, "Rendering...");
         m_bitmap = wxBitmap(RenderElevation());
         m_canvas->SetScrollbars(1, 1, m_rasterW, m_rasterH, 0, 0);
@@ -91,6 +95,10 @@ bool MapView::LoadTile(const std::string& vsiPath)
     m_toWGS84 = OGRCreateCoordinateTransformation(&src, &dst);
 
     GDALClose(ds);
+
+    // Compute inverse geotransform for coordinate → pixel conversion
+    if (!GDALInvGeoTransform(m_gt, m_invGt))
+        return false;
 
     // Compute min/max elevation (excluding nodata)
     m_minElev = FLT_MAX;
@@ -193,6 +201,160 @@ bool MapView::LoadLandCover(const std::string& ar50Path, wxProgressDialog* progr
     GDALClose(memDs);
     GDALClose(ar50);
     return m_hasLandcover;
+}
+
+bool MapView::LoadRailway(const std::string& railwayPath)
+{
+    GDALDataset* ds = static_cast<GDALDataset*>(
+        GDALOpenEx(railwayPath.c_str(), GDAL_OF_VECTOR | GDAL_OF_READONLY,
+                   nullptr, nullptr, nullptr));
+    if (!ds)
+        return false;
+
+    // Set up coordinate transform from railway CRS to tile CRS
+    OGRSpatialReference tileSrs;
+    tileSrs.importFromWkt(m_tileProjectionWkt.c_str());
+    tileSrs.SetAxisMappingStrategy(OAMS_TRADITIONAL_GIS_ORDER);
+
+    // Tile extent in tile CRS for filtering
+    double tileMinX = m_gt[0];
+    double tileMaxX = m_gt[0] + m_rasterW * m_gt[1];
+    double tileMaxY = m_gt[3];
+    double tileMinY = m_gt[3] + m_rasterH * m_gt[5];
+
+    // Load track segments (Banelenke)
+    OGRLayer* tracks = ds->GetLayerByName("Banelenke");
+    if (tracks) {
+        const OGRSpatialReference* trackSrs = tracks->GetSpatialRef();
+        OGRCoordinateTransformation* toTile = nullptr;
+        if (trackSrs) {
+            OGRSpatialReference srcSrs(*trackSrs);
+            srcSrs.SetAxisMappingStrategy(OAMS_TRADITIONAL_GIS_ORDER);
+            toTile = OGRCreateCoordinateTransformation(&srcSrs, &tileSrs);
+        }
+
+        tracks->ResetReading();
+        OGRFeature* feat;
+        while ((feat = tracks->GetNextFeature()) != nullptr) {
+            OGRGeometry* geom = feat->GetGeometryRef();
+            if (!geom) { OGRFeature::DestroyFeature(feat); continue; }
+
+            // Clone and transform to tile CRS
+            OGRGeometry* clone = geom->clone();
+            if (toTile)
+                clone->transform(toTile);
+
+            // Check if geometry intersects the tile extent
+            OGREnvelope env;
+            clone->getEnvelope(&env);
+            if (env.MaxX < tileMinX || env.MinX > tileMaxX ||
+                env.MaxY < tileMinY || env.MinY > tileMaxY) {
+                delete clone;
+                OGRFeature::DestroyFeature(feat);
+                continue;
+            }
+
+            // Extract line points and convert to pixel coordinates
+            // Clamp to safe range for wxWidgets drawing (prevents wxRound overflow)
+            auto clamp = [](double v) -> int {
+                constexpr double kMax = 100000.0;
+                return static_cast<int>(std::clamp(v, -kMax, kMax));
+            };
+
+            auto processLine = [&](OGRLineString* line, const std::string& name) {
+                RailwaySegment seg;
+                seg.name = name;
+                int nPts = line->getNumPoints();
+                for (int p = 0; p < nPts; p++) {
+                    double x = line->getX(p);
+                    double y = line->getY(p);
+                    int px = clamp(m_invGt[0] + x * m_invGt[1] + y * m_invGt[2]);
+                    int py = clamp(m_invGt[3] + x * m_invGt[4] + y * m_invGt[5]);
+                    seg.points.push_back({px, py});
+                }
+                if (!seg.points.empty())
+                    m_railSegments.push_back(std::move(seg));
+            };
+
+            const char* nameField = feat->GetFieldAsString("Banenavn");
+            std::string lineName = nameField ? nameField : "";
+
+            OGRwkbGeometryType gtype = wkbFlatten(clone->getGeometryType());
+            if (gtype == wkbLineString) {
+                processLine(static_cast<OGRLineString*>(clone), lineName);
+            } else if (gtype == wkbMultiLineString) {
+                auto* multi = static_cast<OGRMultiLineString*>(clone);
+                for (int g = 0; g < multi->getNumGeometries(); g++)
+                    processLine(static_cast<OGRLineString*>(multi->getGeometryRef(g)), lineName);
+            }
+
+            delete clone;
+            OGRFeature::DestroyFeature(feat);
+        }
+
+        if (toTile)
+            OCTDestroyCoordinateTransformation(toTile);
+    }
+
+    // Load stations (Stasjonsnode)
+    OGRLayer* stations = ds->GetLayerByName("Stasjonsnode");
+    if (stations) {
+        const OGRSpatialReference* stationSrs = stations->GetSpatialRef();
+        OGRCoordinateTransformation* toTile = nullptr;
+        if (stationSrs) {
+            OGRSpatialReference srcSrs(*stationSrs);
+            srcSrs.SetAxisMappingStrategy(OAMS_TRADITIONAL_GIS_ORDER);
+            toTile = OGRCreateCoordinateTransformation(&srcSrs, &tileSrs);
+        }
+
+        stations->ResetReading();
+        OGRFeature* feat;
+        while ((feat = stations->GetNextFeature()) != nullptr) {
+            OGRGeometry* geom = feat->GetGeometryRef();
+            if (!geom || wkbFlatten(geom->getGeometryType()) != wkbPoint) {
+                OGRFeature::DestroyFeature(feat);
+                continue;
+            }
+
+            OGRPoint* pt = static_cast<OGRPoint*>(geom->clone());
+            if (toTile)
+                pt->transform(toTile);
+
+            double x = pt->getX(), y = pt->getY();
+            delete pt;
+
+            // Check if within tile bounds
+            if (x < tileMinX || x > tileMaxX || y < tileMinY || y > tileMaxY) {
+                OGRFeature::DestroyFeature(feat);
+                continue;
+            }
+
+            int px = std::clamp(static_cast<int>(m_invGt[0] + x * m_invGt[1] + y * m_invGt[2]),
+                                -100000, 100000);
+            int py = std::clamp(static_cast<int>(m_invGt[3] + x * m_invGt[4] + y * m_invGt[5]),
+                                -100000, 100000);
+
+            const char* name = feat->GetFieldAsString("Navn");
+            const char* status = feat->GetFieldAsString("Jernbanestatus");
+            bool active = true;
+            if (status) {
+                std::string s = status;
+                if (s.find("Nedlagt") != std::string::npos ||
+                    s.find("nedlagt") != std::string::npos)
+                    active = false;
+            }
+
+            m_railStations.push_back({{px, py}, name ? name : "", active});
+            OGRFeature::DestroyFeature(feat);
+        }
+
+        if (toTile)
+            OCTDestroyCoordinateTransformation(toTile);
+    }
+
+    GDALClose(ds);
+    m_hasRailway = !m_railSegments.empty() || !m_railStations.empty();
+    return m_hasRailway;
 }
 
 wxImage MapView::RenderElevation() const
@@ -310,6 +472,37 @@ void MapView::OnPaint(wxPaintEvent&)
     m_canvas->DoPrepareDC(dc);
     if (m_bitmap.IsOk())
         dc.DrawBitmap(m_bitmap, 0, 0, false);
+
+    // Railway overlay
+    if (m_hasRailway) {
+        // Draw track lines
+        dc.SetPen(wxPen(wxColour(160, 20, 20), 2));
+        for (const auto& seg : m_railSegments) {
+            if (seg.points.size() < 2)
+                continue;
+            for (size_t i = 1; i < seg.points.size(); i++)
+                dc.DrawLine(seg.points[i - 1], seg.points[i]);
+        }
+
+        // Draw stations
+        dc.SetFont(wxFont(7, wxFONTFAMILY_SWISS, wxFONTSTYLE_NORMAL,
+                          wxFONTWEIGHT_BOLD));
+        for (const auto& st : m_railStations) {
+            if (st.active) {
+                dc.SetPen(wxPen(*wxBLACK, 1));
+                dc.SetBrush(wxBrush(wxColour(255, 220, 50)));
+            } else {
+                dc.SetPen(wxPen(wxColour(100, 100, 100), 1));
+                dc.SetBrush(wxBrush(wxColour(180, 180, 180)));
+            }
+            dc.DrawCircle(st.pos, 4);
+
+            if (!st.name.empty()) {
+                dc.SetTextForeground(st.active ? *wxBLACK : wxColour(100, 100, 100));
+                dc.DrawText(st.name, st.pos.x + 6, st.pos.y - 6);
+            }
+        }
+    }
 }
 
 void MapView::OnMouseMove(wxMouseEvent& event)
