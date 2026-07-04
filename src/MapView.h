@@ -15,7 +15,8 @@ public:
     MapView(wxWindow* parent, const wxString& title,
             const std::string& vsiPath,
             const std::string& ar50Path = "",
-            const std::string& railwayPath = "");
+            const std::string& railwayPath = "",
+            const std::string& roadsPath = "");
     ~MapView();
 
 private:
@@ -46,6 +47,15 @@ private:
     std::vector<RailwayStation> m_railStations;
     bool m_hasRailway = false;
 
+    // Road overlay
+    struct RoadSegment {
+        std::vector<wxPoint> points;
+        char category = 'F';  // E, R, or F
+        int roadNumber = 0;
+    };
+    std::vector<RoadSegment> m_roadSegments;
+    bool m_hasRoads = false;
+
     // Display
     wxScrolledCanvas* m_canvas = nullptr;
     wxBitmap m_bitmap;
@@ -60,6 +70,7 @@ private:
     bool LoadLandCover(const std::string& ar50Path,
                        wxProgressDialog* progress = nullptr);
     bool LoadRailway(const std::string& railwayPath);
+    bool LoadRoads(const std::string& roadsPath);
     wxImage RenderElevation() const;
 
     void OnPaint(wxPaintEvent& event);

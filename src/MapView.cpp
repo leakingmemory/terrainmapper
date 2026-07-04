@@ -14,7 +14,8 @@
 MapView::MapView(wxWindow* parent, const wxString& title,
                  const std::string& vsiPath,
                  const std::string& ar50Path,
-                 const std::string& railwayPath)
+                 const std::string& railwayPath,
+                 const std::string& roadsPath)
     : wxFrame(parent, wxID_ANY, title, wxDefaultPosition, wxSize(900, 700))
 {
     m_canvas = new wxScrolledCanvas(this, wxID_ANY);
@@ -35,6 +36,9 @@ MapView::MapView(wxWindow* parent, const wxString& title,
         progress.Update(10, "Loading land cover...");
         if (!ar50Path.empty())
             LoadLandCover(ar50Path, &progress);
+        progress.Update(85, "Loading road data...");
+        if (!roadsPath.empty())
+            LoadRoads(roadsPath);
         progress.Update(88, "Loading railway data...");
         if (!railwayPath.empty())
             LoadRailway(railwayPath);
@@ -357,6 +361,104 @@ bool MapView::LoadRailway(const std::string& railwayPath)
     return m_hasRailway;
 }
 
+bool MapView::LoadRoads(const std::string& roadsPath)
+{
+    GDALDataset* ds = static_cast<GDALDataset*>(
+        GDALOpenEx(roadsPath.c_str(), GDAL_OF_VECTOR | GDAL_OF_READONLY,
+                   nullptr, nullptr, nullptr));
+    if (!ds)
+        return false;
+
+    OGRLayer* layer = ds->GetLayerByName("roads");
+    if (!layer) {
+        GDALClose(ds);
+        return false;
+    }
+
+    // Set up coordinate transform from roads CRS to tile CRS
+    OGRSpatialReference tileSrs;
+    tileSrs.importFromWkt(m_tileProjectionWkt.c_str());
+    tileSrs.SetAxisMappingStrategy(OAMS_TRADITIONAL_GIS_ORDER);
+
+    const OGRSpatialReference* roadSrs = layer->GetSpatialRef();
+    OGRCoordinateTransformation* toTile = nullptr;
+    if (roadSrs) {
+        OGRSpatialReference srcSrs(*roadSrs);
+        srcSrs.SetAxisMappingStrategy(OAMS_TRADITIONAL_GIS_ORDER);
+        toTile = OGRCreateCoordinateTransformation(&srcSrs, &tileSrs);
+    }
+
+    // Tile extent in tile CRS for filtering
+    double tileMinX = m_gt[0];
+    double tileMaxX = m_gt[0] + m_rasterW * m_gt[1];
+    double tileMaxY = m_gt[3];
+    double tileMinY = m_gt[3] + m_rasterH * m_gt[5];
+
+    // Apply spatial filter in road CRS (transform tile extent to road CRS)
+    if (toTile && roadSrs) {
+        OGRSpatialReference srcSrs(*roadSrs);
+        srcSrs.SetAxisMappingStrategy(OAMS_TRADITIONAL_GIS_ORDER);
+        OGRCoordinateTransformation* fromTile =
+            OGRCreateCoordinateTransformation(&tileSrs, &srcSrs);
+        if (fromTile) {
+            double x1 = tileMinX, y1 = tileMinY;
+            double x2 = tileMaxX, y2 = tileMaxY;
+            fromTile->Transform(1, &x1, &y1);
+            fromTile->Transform(1, &x2, &y2);
+            layer->SetSpatialFilterRect(
+                std::min(x1, x2), std::min(y1, y2),
+                std::max(x1, x2), std::max(y1, y2));
+            OCTDestroyCoordinateTransformation(fromTile);
+        }
+    }
+
+    auto clamp = [](double v) -> int {
+        constexpr double kMax = 100000.0;
+        return static_cast<int>(std::clamp(v, -kMax, kMax));
+    };
+
+    layer->ResetReading();
+    OGRFeature* feat;
+    while ((feat = layer->GetNextFeature()) != nullptr) {
+        OGRGeometry* geom = feat->GetGeometryRef();
+        if (!geom || wkbFlatten(geom->getGeometryType()) != wkbLineString) {
+            OGRFeature::DestroyFeature(feat);
+            continue;
+        }
+
+        OGRLineString* line = static_cast<OGRLineString*>(geom->clone());
+        if (toTile)
+            line->transform(toTile);
+
+        RoadSegment seg;
+        const char* cat = feat->GetFieldAsString("vegkategori");
+        seg.category = (cat && cat[0]) ? cat[0] : 'F';
+        seg.roadNumber = feat->GetFieldAsInteger("vegnummer");
+
+        int nPts = line->getNumPoints();
+        for (int p = 0; p < nPts; p++) {
+            double x = line->getX(p);
+            double y = line->getY(p);
+            int px = clamp(m_invGt[0] + x * m_invGt[1] + y * m_invGt[2]);
+            int py = clamp(m_invGt[3] + x * m_invGt[4] + y * m_invGt[5]);
+            seg.points.push_back({px, py});
+        }
+        delete line;
+
+        if (!seg.points.empty())
+            m_roadSegments.push_back(std::move(seg));
+
+        OGRFeature::DestroyFeature(feat);
+    }
+
+    if (toTile)
+        OCTDestroyCoordinateTransformation(toTile);
+
+    GDALClose(ds);
+    m_hasRoads = !m_roadSegments.empty();
+    return m_hasRoads;
+}
+
 wxImage MapView::RenderElevation() const
 {
     wxImage img(m_rasterW, m_rasterH);
@@ -472,6 +574,28 @@ void MapView::OnPaint(wxPaintEvent&)
     m_canvas->DoPrepareDC(dc);
     if (m_bitmap.IsOk())
         dc.DrawBitmap(m_bitmap, 0, 0, false);
+
+    // Road overlay (drawn first so railway appears on top)
+    if (m_hasRoads) {
+        for (const auto& seg : m_roadSegments) {
+            if (seg.points.size() < 2)
+                continue;
+            // Color and width by road category
+            switch (seg.category) {
+                case 'E':
+                    dc.SetPen(wxPen(wxColour(50, 120, 50), 3));
+                    break;
+                case 'R':
+                    dc.SetPen(wxPen(wxColour(180, 80, 0), 2));
+                    break;
+                default:  // F
+                    dc.SetPen(wxPen(wxColour(100, 100, 100), 1));
+                    break;
+            }
+            for (size_t i = 1; i < seg.points.size(); i++)
+                dc.DrawLine(seg.points[i - 1], seg.points[i]);
+        }
+    }
 
     // Railway overlay
     if (m_hasRailway) {

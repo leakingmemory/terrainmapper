@@ -255,40 +255,44 @@ void MainFrame::OnLoadTransport(wxCommandEvent&)
         return;
 
     const std::string zipPath = dlg.GetPath().ToStdString();
-
-    // Recursively scan the outer zip for an inner zip containing a railway .gdb
     const std::string outerVsi = "/vsizip/" + zipPath;
 
-    // Collect all entries recursively (zip is small, max depth 3)
+    // Recursively scan the outer zip for transport data
     std::string railwayVsiPath;
+    std::string roadZipVsiPath;  // path to the inner VegnettPluss zip
+
     std::function<void(const std::string&, int)> scanDir =
         [&](const std::string& dir, int depth) {
-        if (depth > 4 || !railwayVsiPath.empty())
+        if (depth > 4)
             return;
         char** entries = VSIReadDir(dir.c_str());
         if (!entries)
             return;
-        for (int i = 0; entries[i] && railwayVsiPath.empty(); i++) {
+        for (int i = 0; entries[i]; i++) {
             std::string name = entries[i];
-            if (name.find("Banenettverk") != std::string::npos &&
-                name.size() >= 4 &&
-                name.substr(name.size() - 4) == ".zip") {
-                // Found the inner railway zip — look for .gdb inside
-                std::string innerVsi = "/vsizip/" + dir + "/" + name;
-                char** gdbEntries = VSIReadDir(innerVsi.c_str());
-                if (gdbEntries) {
-                    for (int k = 0; gdbEntries[k]; k++) {
-                        std::string gdbName = gdbEntries[k];
-                        if (gdbName.size() >= 4 &&
-                            gdbName.substr(gdbName.size() - 4) == ".gdb") {
-                            railwayVsiPath = innerVsi + "/" + gdbName;
-                            break;
+            if (name.size() >= 4 && name.substr(name.size() - 4) == ".zip") {
+                if (name.find("Banenettverk") != std::string::npos &&
+                    name.find("FGDB") != std::string::npos &&
+                    railwayVsiPath.empty()) {
+                    // Found railway FGDB zip — look for .gdb inside
+                    std::string innerVsi = "/vsizip/" + dir + "/" + name;
+                    char** gdbEntries = VSIReadDir(innerVsi.c_str());
+                    if (gdbEntries) {
+                        for (int k = 0; gdbEntries[k]; k++) {
+                            std::string gdbName = gdbEntries[k];
+                            if (gdbName.size() >= 4 &&
+                                gdbName.substr(gdbName.size() - 4) == ".gdb") {
+                                railwayVsiPath = innerVsi + "/" + gdbName;
+                                break;
+                            }
                         }
+                        CSLDestroy(gdbEntries);
                     }
-                    CSLDestroy(gdbEntries);
+                } else if (name.find("NVDB-VegnettPluss") != std::string::npos &&
+                           roadZipVsiPath.empty()) {
+                    roadZipVsiPath = dir + "/" + name;
                 }
             } else {
-                // Recurse into subdirectory
                 scanDir(dir + "/" + name, depth + 1);
             }
         }
@@ -296,43 +300,245 @@ void MainFrame::OnLoadTransport(wxCommandEvent&)
     };
     scanDir(outerVsi, 0);
 
-    if (railwayVsiPath.empty()) {
-        wxMessageBox("No railway geodatabase found in the ZIP.\n"
-                     "Expected a nested zip containing '*Banenettverk*.gdb'.",
+    if (railwayVsiPath.empty() && roadZipVsiPath.empty()) {
+        wxMessageBox("No transport data found in the ZIP.\n"
+                     "Expected '*Banenettverk*FGDB.zip' or '*NVDB-VegnettPluss*.zip'.",
                      "Error", wxICON_ERROR | wxOK, this);
         return;
     }
 
-    // Verify the .gdb opens and has the expected layers
-    GDALDataset* ds = static_cast<GDALDataset*>(
-        GDALOpenEx(railwayVsiPath.c_str(), GDAL_OF_VECTOR | GDAL_OF_READONLY,
-                   nullptr, nullptr, nullptr));
-    if (!ds) {
-        wxMessageBox("Could not open the railway geodatabase.", "Error",
-                     wxICON_ERROR | wxOK, this);
-        return;
+    // --- Railway ---
+    int trackCount = 0, stationCount = 0;
+    if (!railwayVsiPath.empty()) {
+        GDALDataset* ds = static_cast<GDALDataset*>(
+            GDALOpenEx(railwayVsiPath.c_str(), GDAL_OF_VECTOR | GDAL_OF_READONLY,
+                       nullptr, nullptr, nullptr));
+        if (ds) {
+            OGRLayer* tracks = ds->GetLayerByName("Banelenke");
+            OGRLayer* stations = ds->GetLayerByName("Stasjonsnode");
+            trackCount = tracks ? static_cast<int>(tracks->GetFeatureCount()) : 0;
+            stationCount = stations ? static_cast<int>(stations->GetFeatureCount()) : 0;
+            GDALClose(ds);
+            m_railwayPath = railwayVsiPath;
+        }
     }
 
-    OGRLayer* tracks = ds->GetLayerByName("Banelenke");
-    OGRLayer* stations = ds->GetLayerByName("Stasjonsnode");
-    int trackCount = tracks ? static_cast<int>(tracks->GetFeatureCount()) : 0;
-    int stationCount = stations ? static_cast<int>(stations->GetFeatureCount()) : 0;
-    GDALClose(ds);
+    // --- Roads ---
+    int roadCount = 0;
+    if (!roadZipVsiPath.empty()) {
+        // Extract the inner road zip from the outer zip, then convert GML → GPKG
+        // First extract the inner zip to a temp file
+        CleanupRoadsTemp();
 
-    if (!tracks && !stations) {
-        wxMessageBox("No railway layers found (expected Banelenke/Stasjonsnode).",
-                     "Error", wxICON_ERROR | wxOK, this);
-        return;
+        wxString tempBase = wxFileName::GetTempDir() + wxFileName::GetPathSeparator()
+                            + "terrainmapper_roads_XXXXXX";
+        std::string tempTemplate = tempBase.ToStdString();
+        char* tempDir = mkdtemp(tempTemplate.data());
+        if (!tempDir) {
+            wxMessageBox("Could not create temporary directory.", "Error",
+                         wxICON_ERROR | wxOK, this);
+        } else {
+            m_roadsTempDir = tempDir;
+            const std::string innerZipPath = m_roadsTempDir + "/road.zip";
+
+            // Find and extract the inner zip entry from the outer zip using libzip
+            int err = 0;
+            zip_t* z = zip_open(zipPath.c_str(), ZIP_RDONLY, &err);
+            if (!z) {
+                wxMessageBox("Could not open ZIP file.", "Error",
+                             wxICON_ERROR | wxOK, this);
+                CleanupRoadsTemp();
+            } else {
+                // Find the VegnettPluss entry
+                zip_int64_t n = zip_get_num_entries(z, 0);
+                zip_int64_t roadIdx = -1;
+                zip_uint64_t roadSize = 0;
+                for (zip_int64_t i = 0; i < n; i++) {
+                    zip_stat_t st;
+                    zip_stat_init(&st);
+                    if (zip_stat_index(z, i, 0, &st) != 0) continue;
+                    std::string name = st.name;
+                    if (name.find("NVDB-VegnettPluss") != std::string::npos &&
+                        name.size() >= 4 && name.substr(name.size() - 4) == ".zip") {
+                        roadIdx = i;
+                        roadSize = (st.valid & ZIP_STAT_SIZE) ? st.size : 0;
+                        break;
+                    }
+                }
+
+                if (roadIdx < 0) {
+                    zip_close(z);
+                    CleanupRoadsTemp();
+                } else {
+                    wxProgressDialog progress(
+                        "Loading Road Data",
+                        "Extracting road archive...",
+                        100, this,
+                        wxPD_AUTO_HIDE | wxPD_APP_MODAL | wxPD_SMOOTH |
+                        wxPD_ELAPSED_TIME | wxPD_ESTIMATED_TIME);
+
+                    zip_file_t* zf = zip_fopen_index(z, roadIdx, 0);
+                    FILE* fp = fopen(innerZipPath.c_str(), "wb");
+                    std::vector<char> buf(1024 * 1024);
+                    zip_uint64_t bytesWritten = 0;
+                    zip_int64_t nread;
+                    while ((nread = zip_fread(zf, buf.data(), buf.size())) > 0) {
+                        fwrite(buf.data(), 1, static_cast<size_t>(nread), fp);
+                        bytesWritten += nread;
+                        if (roadSize > 0) {
+                            int pct = static_cast<int>(bytesWritten * 30 / roadSize);
+                            progress.Update(pct, wxString::Format(
+                                "Extracting road archive... %llu MB / %llu MB",
+                                (unsigned long long)(bytesWritten / (1024*1024)),
+                                (unsigned long long)(roadSize / (1024*1024))));
+                        }
+                    }
+                    fclose(fp);
+                    zip_fclose(zf);
+                    zip_close(z);
+
+                    // List GML files inside the extracted zip
+                    const std::string roadVsi = "/vsizip/" + innerZipPath;
+                    char** gmlFiles = VSIReadDir(roadVsi.c_str());
+                    std::vector<std::string> gmlNames;
+                    if (gmlFiles) {
+                        for (int i = 0; gmlFiles[i]; i++) {
+                            std::string fname = gmlFiles[i];
+                            if (fname.size() > 4 &&
+                                fname.substr(fname.size() - 4) == ".gml")
+                                gmlNames.push_back(fname);
+                        }
+                        CSLDestroy(gmlFiles);
+                    }
+
+                    if (gmlNames.empty()) {
+                        progress.Update(100);
+                        CleanupRoadsTemp();
+                    } else {
+                        // Convert GML files → single GPKG with major roads only
+                        const std::string gpkgPath = m_roadsTempDir + "/roads.gpkg";
+                        bool firstFile = true;
+
+                        for (size_t fi = 0; fi < gmlNames.size(); fi++) {
+                            int pct = 30 + static_cast<int>(fi * 65 / gmlNames.size());
+                            progress.Update(pct, wxString::Format(
+                                "Converting road data (%zu/%zu)...",
+                                fi + 1, gmlNames.size()));
+
+                            std::string gmlPath = roadVsi + "/" + gmlNames[fi];
+                            GDALDataset* src = static_cast<GDALDataset*>(
+                                GDALOpenEx(gmlPath.c_str(),
+                                           GDAL_OF_VECTOR | GDAL_OF_READONLY,
+                                           nullptr, nullptr, nullptr));
+                            if (!src) continue;
+
+                            OGRLayer* veglenke = src->GetLayerByName("Veglenke");
+                            if (!veglenke) { GDALClose(src); continue; }
+
+                            veglenke->SetAttributeFilter(
+                                "vegkategori IN ('E','R','F')");
+
+                            if (veglenke->GetFeatureCount() == 0) {
+                                GDALClose(src);
+                                continue;
+                            }
+
+                            GDALDataset* dst;
+                            if (firstFile) {
+                                GDALDriver* gpkgDrv =
+                                    GetGDALDriverManager()->GetDriverByName("GPKG");
+                                dst = gpkgDrv->Create(gpkgPath.c_str(),
+                                                      0, 0, 0, GDT_Unknown, nullptr);
+                                if (!dst) { GDALClose(src); break; }
+                            } else {
+                                dst = static_cast<GDALDataset*>(
+                                    GDALOpenEx(gpkgPath.c_str(),
+                                               GDAL_OF_VECTOR | GDAL_OF_UPDATE,
+                                               nullptr, nullptr, nullptr));
+                                if (!dst) { GDALClose(src); break; }
+                            }
+
+                            OGRLayer* dstLayer;
+                            if (firstFile) {
+                                OGRSpatialReference* srs =
+                                    veglenke->GetSpatialRef() ?
+                                    veglenke->GetSpatialRef()->Clone() : nullptr;
+                                dstLayer = dst->CreateLayer(
+                                    "roads", srs, wkbLineString, nullptr);
+                                if (srs) srs->Release();
+                                if (dstLayer) {
+                                    OGRFieldDefn fldCat("vegkategori", OFTString);
+                                    fldCat.SetWidth(1);
+                                    (void)dstLayer->CreateField(&fldCat);
+                                    OGRFieldDefn fldNum("vegnummer", OFTInteger);
+                                    (void)dstLayer->CreateField(&fldNum);
+                                }
+                                firstFile = false;
+                            } else {
+                                dstLayer = dst->GetLayerByName("roads");
+                            }
+
+                            if (dstLayer) {
+                                veglenke->ResetReading();
+                                OGRFeature* feat;
+                                while ((feat = veglenke->GetNextFeature()) != nullptr) {
+                                    OGRFeature* outFeat =
+                                        OGRFeature::CreateFeature(dstLayer->GetLayerDefn());
+                                    outFeat->SetGeometry(feat->GetGeometryRef());
+                                    const char* cat = feat->GetFieldAsString("vegkategori");
+                                    if (cat) outFeat->SetField("vegkategori", cat);
+                                    int vegnum = feat->GetFieldAsInteger("vegnummer");
+                                    outFeat->SetField("vegnummer", vegnum);
+                                    (void)dstLayer->CreateFeature(outFeat);
+                                    OGRFeature::DestroyFeature(outFeat);
+                                    OGRFeature::DestroyFeature(feat);
+                                    roadCount++;
+                                }
+                            }
+
+                            GDALClose(dst);
+                            GDALClose(src);
+                        }
+
+                        progress.Update(98, "Finalizing...");
+
+                        if (roadCount > 0)
+                            m_roadsPath = gpkgPath;
+                        else
+                            CleanupRoadsTemp();
+
+                        progress.Update(100);
+                    }
+                }
+            }
+        }
     }
 
-    m_railwayPath = railwayVsiPath;
-    SetStatusText(wxString::Format("Railway data loaded: %d track segments, %d stations",
-                                   trackCount, stationCount));
+    // Summary
+    wxString msg;
+    if (!m_railwayPath.empty())
+        msg += wxString::Format("Railway: %d tracks, %d stations. ",
+                                trackCount, stationCount);
+    if (!m_roadsPath.empty())
+        msg += wxString::Format("Roads: %d segments (E/R/F).", roadCount);
+    if (msg.empty())
+        msg = "No usable transport data found.";
+    SetStatusText(msg);
+}
+
+void MainFrame::CleanupRoadsTemp()
+{
+    if (m_roadsTempDir.empty())
+        return;
+    wxFileName::Rmdir(m_roadsTempDir, wxPATH_RMDIR_RECURSIVE);
+    m_roadsTempDir.clear();
+    m_roadsPath.clear();
 }
 
 MainFrame::~MainFrame()
 {
     CleanupAr50Temp();
+    CleanupRoadsTemp();
 }
 
 void MainFrame::LoadZip(const wxString& path)
@@ -452,6 +658,8 @@ void MainFrame::OnCloseAll(wxCommandEvent&)
     m_list->DeleteAllItems();
     m_zipPaths.clear();
     CleanupAr50Temp();
+    CleanupRoadsTemp();
+    m_railwayPath.clear();
     UpdateTitleAndStatus();
 }
 
@@ -551,7 +759,8 @@ void MainFrame::OnTileActivated(wxListEvent& event)
     if (std::regex_search(entryName, m, sheetRe))
         title = wxString::Format("Tile %s", m[1].str());
 
-    auto* view = new MapView(nullptr, title, vsiPath, m_ar50Path, m_railwayPath);
+    auto* view = new MapView(nullptr, title, vsiPath, m_ar50Path, m_railwayPath,
+                             m_roadsPath);
     view->Show();
 }
 

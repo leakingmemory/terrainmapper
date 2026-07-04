@@ -28,8 +28,11 @@ private:
     std::string m_ar50Path;       // path to the AR50 .gdb (on disk)
     std::string m_ar50TempDir;    // temp directory to clean up
     std::string m_railwayPath;    // vsizip path to railway .gdb
+    std::string m_roadsPath;      // path to roads GPKG (on disk)
+    std::string m_roadsTempDir;   // temp directory for road data
 
     void CleanupAr50Temp();
+    void CleanupRoadsTemp();
 
     void OnOpenZip(wxCommandEvent& event);
     void OnLoadLandCover(wxCommandEvent& event);
