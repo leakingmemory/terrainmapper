@@ -588,8 +588,14 @@ void MapView::OnPaint(wxPaintEvent&)
                 case 'R':
                     dc.SetPen(wxPen(wxColour(180, 80, 0), 2));
                     break;
-                default:  // F
+                case 'F':
                     dc.SetPen(wxPen(wxColour(100, 100, 100), 1));
+                    break;
+                case 'K':
+                    dc.SetPen(wxPen(wxColour(160, 160, 160), 1));
+                    break;
+                default:  // P (private)
+                    dc.SetPen(wxPen(wxColour(180, 180, 180), 1, wxPENSTYLE_SHORT_DASH));
                     break;
             }
             for (size_t i = 1; i < seg.points.size(); i++)

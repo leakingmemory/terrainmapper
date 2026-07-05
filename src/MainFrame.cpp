@@ -319,7 +319,7 @@ void MainFrame::OnLoadTransport(wxCommandEvent&)
         wxFileName zipFn(zipPath);
         const std::string cachedGpkg =
             (zipFn.GetPath() + wxFileName::GetPathSeparator()
-             + zipFn.GetName() + "_roads.gpkg").ToStdString();
+             + zipFn.GetName() + "_roads_v3.gpkg").ToStdString();
 
         // Check if a cached GPKG already exists
         GDALDataset* cached = static_cast<GDALDataset*>(
@@ -438,7 +438,7 @@ void MainFrame::OnLoadTransport(wxCommandEvent&)
                                 if (!veglenke) { GDALClose(src); continue; }
 
                                 veglenke->SetAttributeFilter(
-                                    "vegkategori IN ('E','R','F')");
+                                    "vegkategori IN ('E','R','F','K','P')");
 
                                 if (veglenke->GetFeatureCount() == 0) {
                                     GDALClose(src);
@@ -523,7 +523,7 @@ void MainFrame::OnLoadTransport(wxCommandEvent&)
         msg += wxString::Format("Railway: %d tracks, %d stations. ",
                                 trackCount, stationCount);
     if (!m_roadsPath.empty())
-        msg += wxString::Format("Roads: %d segments (E/R/F).", roadCount);
+        msg += wxString::Format("Roads: %d segments.", roadCount);
     if (msg.empty())
         msg = "No usable transport data found.";
     SetStatusText(msg);
