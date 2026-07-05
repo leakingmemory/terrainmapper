@@ -37,11 +37,13 @@ private:
     struct RailwaySegment {
         std::vector<wxPoint> points;
         std::string name;
+        char status = 'I';   // I=operational, N=closed, P=planned, M=museum, F=construction
+        char medium = ' ';   // ' '=surface, U=underground, L/B=bridge, T=metro
     };
     struct RailwayStation {
         wxPoint pos;
         std::string name;
-        bool active = true;  // based on Jernbanestatus
+        char type = 'S';     // S=station, I=interchange
     };
     std::vector<RailwaySegment> m_railSegments;
     std::vector<RailwayStation> m_railStations;

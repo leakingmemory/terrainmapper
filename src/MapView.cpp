@@ -226,7 +226,14 @@ bool MapView::LoadRailway(const std::string& railwayPath)
     double tileMaxY = m_gt[3];
     double tileMinY = m_gt[3] + m_rasterH * m_gt[5];
 
+    auto clamp = [](double v) -> int {
+        constexpr double kMax = 100000.0;
+        return static_cast<int>(std::clamp(v, -kMax, kMax));
+    };
+
     // Load track segments (Banelenke)
+    // GML has 8172 individual track segments including sidings, passing loops,
+    // and parallel tracks at stations — much more detail than the FGDB version.
     OGRLayer* tracks = ds->GetLayerByName("Banelenke");
     if (tracks) {
         const OGRSpatialReference* trackSrs = tracks->GetSpatialRef();
@@ -258,16 +265,19 @@ bool MapView::LoadRailway(const std::string& railwayPath)
                 continue;
             }
 
-            // Extract line points and convert to pixel coordinates
-            // Clamp to safe range for wxWidgets drawing (prevents wxRound overflow)
-            auto clamp = [](double v) -> int {
-                constexpr double kMax = 100000.0;
-                return static_cast<int>(std::clamp(v, -kMax, kMax));
-            };
+            // Read attributes (GML field names are lowercase)
+            const char* nameField = feat->GetFieldAsString("banenavn");
+            const char* statusField = feat->GetFieldAsString("banestatus");
+            const char* mediumField = feat->GetFieldAsString("medium");
+            std::string lineName = nameField ? nameField : "";
+            char status = (statusField && statusField[0]) ? statusField[0] : 'I';
+            char medium = (mediumField && mediumField[0]) ? mediumField[0] : ' ';
 
-            auto processLine = [&](OGRLineString* line, const std::string& name) {
+            auto processLine = [&](OGRLineString* line) {
                 RailwaySegment seg;
-                seg.name = name;
+                seg.name = lineName;
+                seg.status = status;
+                seg.medium = medium;
                 int nPts = line->getNumPoints();
                 for (int p = 0; p < nPts; p++) {
                     double x = line->getX(p);
@@ -280,16 +290,13 @@ bool MapView::LoadRailway(const std::string& railwayPath)
                     m_railSegments.push_back(std::move(seg));
             };
 
-            const char* nameField = feat->GetFieldAsString("Banenavn");
-            std::string lineName = nameField ? nameField : "";
-
             OGRwkbGeometryType gtype = wkbFlatten(clone->getGeometryType());
             if (gtype == wkbLineString) {
-                processLine(static_cast<OGRLineString*>(clone), lineName);
+                processLine(static_cast<OGRLineString*>(clone));
             } else if (gtype == wkbMultiLineString) {
                 auto* multi = static_cast<OGRMultiLineString*>(clone);
                 for (int g = 0; g < multi->getNumGeometries(); g++)
-                    processLine(static_cast<OGRLineString*>(multi->getGeometryRef(g)), lineName);
+                    processLine(static_cast<OGRLineString*>(multi->getGeometryRef(g)));
             }
 
             delete clone;
@@ -333,22 +340,15 @@ bool MapView::LoadRailway(const std::string& railwayPath)
                 continue;
             }
 
-            int px = std::clamp(static_cast<int>(m_invGt[0] + x * m_invGt[1] + y * m_invGt[2]),
-                                -100000, 100000);
-            int py = std::clamp(static_cast<int>(m_invGt[3] + x * m_invGt[4] + y * m_invGt[5]),
-                                -100000, 100000);
+            int px = clamp(m_invGt[0] + x * m_invGt[1] + y * m_invGt[2]);
+            int py = clamp(m_invGt[3] + x * m_invGt[4] + y * m_invGt[5]);
 
-            const char* name = feat->GetFieldAsString("Navn");
-            const char* status = feat->GetFieldAsString("Jernbanestatus");
-            bool active = true;
-            if (status) {
-                std::string s = status;
-                if (s.find("Nedlagt") != std::string::npos ||
-                    s.find("nedlagt") != std::string::npos)
-                    active = false;
-            }
+            // GML uses 'stasjonsnavn' and 'stasjonstype'
+            const char* name = feat->GetFieldAsString("stasjonsnavn");
+            const char* typeField = feat->GetFieldAsString("stasjonstype");
+            char type = (typeField && typeField[0]) ? typeField[0] : 'S';
 
-            m_railStations.push_back({{px, py}, name ? name : "", active});
+            m_railStations.push_back({{px, py}, name ? name : "", type});
             OGRFeature::DestroyFeature(feat);
         }
 
@@ -599,11 +599,33 @@ void MapView::OnPaint(wxPaintEvent&)
 
     // Railway overlay
     if (m_hasRailway) {
-        // Draw track lines
-        dc.SetPen(wxPen(wxColour(160, 20, 20), 2));
+        // Draw track lines — style varies by status and medium
         for (const auto& seg : m_railSegments) {
             if (seg.points.size() < 2)
                 continue;
+
+            switch (seg.status) {
+                case 'I':  // operational
+                    if (seg.medium == 'U')
+                        dc.SetPen(wxPen(wxColour(160, 20, 20), 2, wxPENSTYLE_SHORT_DASH));
+                    else
+                        dc.SetPen(wxPen(wxColour(160, 20, 20), 2));
+                    break;
+                case 'N':  // closed
+                    dc.SetPen(wxPen(wxColour(140, 120, 120), 1, wxPENSTYLE_DOT));
+                    break;
+                case 'M':  // museum
+                    dc.SetPen(wxPen(wxColour(140, 100, 40), 1));
+                    break;
+                case 'P':  // planned
+                case 'F':  // under construction
+                    dc.SetPen(wxPen(wxColour(160, 20, 20), 1, wxPENSTYLE_LONG_DASH));
+                    break;
+                default:
+                    dc.SetPen(wxPen(wxColour(160, 20, 20), 2));
+                    break;
+            }
+
             for (size_t i = 1; i < seg.points.size(); i++)
                 dc.DrawLine(seg.points[i - 1], seg.points[i]);
         }
@@ -612,17 +634,19 @@ void MapView::OnPaint(wxPaintEvent&)
         dc.SetFont(wxFont(7, wxFONTFAMILY_SWISS, wxFONTSTYLE_NORMAL,
                           wxFONTWEIGHT_BOLD));
         for (const auto& st : m_railStations) {
-            if (st.active) {
+            if (st.type == 'I') {
+                // Interchange — larger marker
+                dc.SetPen(wxPen(*wxBLACK, 1));
+                dc.SetBrush(wxBrush(wxColour(255, 180, 50)));
+                dc.DrawCircle(st.pos, 5);
+            } else {
                 dc.SetPen(wxPen(*wxBLACK, 1));
                 dc.SetBrush(wxBrush(wxColour(255, 220, 50)));
-            } else {
-                dc.SetPen(wxPen(wxColour(100, 100, 100), 1));
-                dc.SetBrush(wxBrush(wxColour(180, 180, 180)));
+                dc.DrawCircle(st.pos, 4);
             }
-            dc.DrawCircle(st.pos, 4);
 
             if (!st.name.empty()) {
-                dc.SetTextForeground(st.active ? *wxBLACK : wxColour(100, 100, 100));
+                dc.SetTextForeground(*wxBLACK);
                 dc.DrawText(st.name, st.pos.x + 6, st.pos.y - 6);
             }
         }

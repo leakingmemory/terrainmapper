@@ -258,8 +258,8 @@ void MainFrame::OnLoadTransport(wxCommandEvent&)
     const std::string outerVsi = "/vsizip/" + zipPath;
 
     // Recursively scan the outer zip for transport data
-    std::string railwayVsiPath;
-    std::string roadZipVsiPath;  // path to the inner VegnettPluss zip
+    std::string railwayVsiPath;   // GML railway dataset (preferred, more detail)
+    std::string roadZipVsiPath;   // path to the inner VegnettPluss zip
 
     std::function<void(const std::string&, int)> scanDir =
         [&](const std::string& dir, int depth) {
@@ -272,22 +272,10 @@ void MainFrame::OnLoadTransport(wxCommandEvent&)
             std::string name = entries[i];
             if (name.size() >= 4 && name.substr(name.size() - 4) == ".zip") {
                 if (name.find("Banenettverk") != std::string::npos &&
-                    name.find("FGDB") != std::string::npos &&
+                    name.find("GML") != std::string::npos &&
                     railwayVsiPath.empty()) {
-                    // Found railway FGDB zip — look for .gdb inside
-                    std::string innerVsi = "/vsizip/" + dir + "/" + name;
-                    char** gdbEntries = VSIReadDir(innerVsi.c_str());
-                    if (gdbEntries) {
-                        for (int k = 0; gdbEntries[k]; k++) {
-                            std::string gdbName = gdbEntries[k];
-                            if (gdbName.size() >= 4 &&
-                                gdbName.substr(gdbName.size() - 4) == ".gdb") {
-                                railwayVsiPath = innerVsi + "/" + gdbName;
-                                break;
-                            }
-                        }
-                        CSLDestroy(gdbEntries);
-                    }
+                    // Found railway GML zip — use it directly via /vsizip/
+                    railwayVsiPath = "/vsizip/" + dir + "/" + name;
                 } else if (name.find("NVDB-VegnettPluss") != std::string::npos &&
                            roadZipVsiPath.empty()) {
                     roadZipVsiPath = dir + "/" + name;
@@ -302,7 +290,7 @@ void MainFrame::OnLoadTransport(wxCommandEvent&)
 
     if (railwayVsiPath.empty() && roadZipVsiPath.empty()) {
         wxMessageBox("No transport data found in the ZIP.\n"
-                     "Expected '*Banenettverk*FGDB.zip' or '*NVDB-VegnettPluss*.zip'.",
+                     "Expected '*Banenettverk*GML.zip' or '*NVDB-VegnettPluss*.zip'.",
                      "Error", wxICON_ERROR | wxOK, this);
         return;
     }
