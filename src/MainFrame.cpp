@@ -417,99 +417,88 @@ void MainFrame::OnLoadTransport(wxCommandEvent&)
                             progress.Update(100);
                             CleanupRoadsTemp();
                         } else {
-                            // Convert GML files → single GPKG with major roads only
-                            // Write to persistent location next to the source zip
-                            bool firstFile = true;
+                            // Convert GML files → single GPKG with major roads only.
+                            // Keep the GPKG open for the entire conversion and use a
+                            // single transaction to avoid per-feature fsync overhead.
+                            GDALDriver* gpkgDrv =
+                                GetGDALDriverManager()->GetDriverByName("GPKG");
+                            GDALDataset* dst = gpkgDrv->Create(
+                                cachedGpkg.c_str(), 0, 0, 0, GDT_Unknown, nullptr);
 
-                            for (size_t fi = 0; fi < gmlNames.size(); fi++) {
-                                int pct = 30 + static_cast<int>(fi * 65 / gmlNames.size());
-                                progress.Update(pct, wxString::Format(
-                                    "Converting road data (%zu/%zu)...",
-                                    fi + 1, gmlNames.size()));
+                            if (!dst) {
+                                CleanupRoadsTemp();
+                            } else {
+                                OGRLayer* dstLayer = nullptr;
 
-                                std::string gmlPath = roadVsi + "/" + gmlNames[fi];
-                                GDALDataset* src = static_cast<GDALDataset*>(
-                                    GDALOpenEx(gmlPath.c_str(),
-                                               GDAL_OF_VECTOR | GDAL_OF_READONLY,
-                                               nullptr, nullptr, nullptr));
-                                if (!src) continue;
+                                for (size_t fi = 0; fi < gmlNames.size(); fi++) {
+                                    int pct = 30 + static_cast<int>(fi * 65 / gmlNames.size());
+                                    progress.Update(pct, wxString::Format(
+                                        "Converting road data (%zu/%zu)...",
+                                        fi + 1, gmlNames.size()));
 
-                                OGRLayer* veglenke = src->GetLayerByName("Veglenke");
-                                if (!veglenke) { GDALClose(src); continue; }
-
-                                veglenke->SetAttributeFilter(
-                                    "vegkategori IN ('E','R','F','K','P')");
-
-                                if (veglenke->GetFeatureCount() == 0) {
-                                    GDALClose(src);
-                                    continue;
-                                }
-
-                                GDALDataset* dst;
-                                if (firstFile) {
-                                    GDALDriver* gpkgDrv =
-                                        GetGDALDriverManager()->GetDriverByName("GPKG");
-                                    dst = gpkgDrv->Create(cachedGpkg.c_str(),
-                                                          0, 0, 0, GDT_Unknown, nullptr);
-                                    if (!dst) { GDALClose(src); break; }
-                                } else {
-                                    dst = static_cast<GDALDataset*>(
-                                        GDALOpenEx(cachedGpkg.c_str(),
-                                                   GDAL_OF_VECTOR | GDAL_OF_UPDATE,
+                                    std::string gmlPath = roadVsi + "/" + gmlNames[fi];
+                                    GDALDataset* src = static_cast<GDALDataset*>(
+                                        GDALOpenEx(gmlPath.c_str(),
+                                                   GDAL_OF_VECTOR | GDAL_OF_READONLY,
                                                    nullptr, nullptr, nullptr));
-                                    if (!dst) { GDALClose(src); break; }
-                                }
+                                    if (!src) continue;
 
-                                OGRLayer* dstLayer;
-                                if (firstFile) {
-                                    OGRSpatialReference* srs =
-                                        veglenke->GetSpatialRef() ?
-                                        veglenke->GetSpatialRef()->Clone() : nullptr;
-                                    dstLayer = dst->CreateLayer(
-                                        "roads", srs, wkbLineString, nullptr);
-                                    if (srs) srs->Release();
+                                    OGRLayer* veglenke = src->GetLayerByName("Veglenke");
+                                    if (!veglenke) { GDALClose(src); continue; }
+
+                                    veglenke->SetAttributeFilter(
+                                        "vegkategori IN ('E','R','F','K','P')");
+
+                                    // Create output layer from the first source file
+                                    if (!dstLayer) {
+                                        OGRSpatialReference* srs =
+                                            veglenke->GetSpatialRef() ?
+                                            veglenke->GetSpatialRef()->Clone() : nullptr;
+                                        dstLayer = dst->CreateLayer(
+                                            "roads", srs, wkbLineString, nullptr);
+                                        if (srs) srs->Release();
+                                        if (dstLayer) {
+                                            OGRFieldDefn fldCat("vegkategori", OFTString);
+                                            fldCat.SetWidth(1);
+                                            (void)dstLayer->CreateField(&fldCat);
+                                            OGRFieldDefn fldNum("vegnummer", OFTInteger);
+                                            (void)dstLayer->CreateField(&fldNum);
+                                        }
+                                    }
+
                                     if (dstLayer) {
-                                        OGRFieldDefn fldCat("vegkategori", OFTString);
-                                        fldCat.SetWidth(1);
-                                        (void)dstLayer->CreateField(&fldCat);
-                                        OGRFieldDefn fldNum("vegnummer", OFTInteger);
-                                        (void)dstLayer->CreateField(&fldNum);
+                                        (void)dstLayer->StartTransaction();
+                                        veglenke->ResetReading();
+                                        OGRFeature* feat;
+                                        while ((feat = veglenke->GetNextFeature()) != nullptr) {
+                                            OGRFeature* outFeat =
+                                                OGRFeature::CreateFeature(dstLayer->GetLayerDefn());
+                                            outFeat->SetGeometry(feat->GetGeometryRef());
+                                            const char* cat = feat->GetFieldAsString("vegkategori");
+                                            if (cat) outFeat->SetField("vegkategori", cat);
+                                            int vegnum = feat->GetFieldAsInteger("vegnummer");
+                                            outFeat->SetField("vegnummer", vegnum);
+                                            (void)dstLayer->CreateFeature(outFeat);
+                                            OGRFeature::DestroyFeature(outFeat);
+                                            OGRFeature::DestroyFeature(feat);
+                                            roadCount++;
+                                        }
+                                        (void)dstLayer->CommitTransaction();
                                     }
-                                    firstFile = false;
-                                } else {
-                                    dstLayer = dst->GetLayerByName("roads");
+
+                                    GDALClose(src);
                                 }
 
-                                if (dstLayer) {
-                                    veglenke->ResetReading();
-                                    OGRFeature* feat;
-                                    while ((feat = veglenke->GetNextFeature()) != nullptr) {
-                                        OGRFeature* outFeat =
-                                            OGRFeature::CreateFeature(dstLayer->GetLayerDefn());
-                                        outFeat->SetGeometry(feat->GetGeometryRef());
-                                        const char* cat = feat->GetFieldAsString("vegkategori");
-                                        if (cat) outFeat->SetField("vegkategori", cat);
-                                        int vegnum = feat->GetFieldAsInteger("vegnummer");
-                                        outFeat->SetField("vegnummer", vegnum);
-                                        (void)dstLayer->CreateFeature(outFeat);
-                                        OGRFeature::DestroyFeature(outFeat);
-                                        OGRFeature::DestroyFeature(feat);
-                                        roadCount++;
-                                    }
-                                }
-
+                                progress.Update(98, "Finalizing...");
                                 GDALClose(dst);
-                                GDALClose(src);
+
+                                if (roadCount > 0)
+                                    m_roadsPath = cachedGpkg;
+
+                                // Clean up temp (inner zip extraction)
+                                CleanupRoadsTemp();
+                                progress.Update(100);
                             }
-
-                            progress.Update(98, "Finalizing...");
-
-                            if (roadCount > 0)
-                                m_roadsPath = cachedGpkg;
-
-                            // Clean up temp (inner zip extraction)
-                            CleanupRoadsTemp();
-                            progress.Update(100);
                         }
                     }
                 }
