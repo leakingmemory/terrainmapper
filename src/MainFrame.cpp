@@ -45,7 +45,7 @@ MainFrame::MainFrame()
     fileMenu->Append(ID_OpenZip, "&Open ZIP...\tCtrl+O", "Open one or more ZIP archives");
     fileMenu->Append(ID_LoadLandCover, "Load &Land Cover...", "Load an AR50 land cover dataset (.gdb in .zip)");
     fileMenu->Append(ID_LoadTransport, "Load &Transport Data...", "Load railway network (.gdb in .zip)");
-    fileMenu->Append(ID_RailwayProfile, "Railway &Profiles...\tCtrl+P", "Show railway elevation profiles");
+    fileMenu->Append(ID_RailwayProfile, "Elevation &Profiles...\tCtrl+P", "Show railway and road elevation profiles");
     fileMenu->Append(ID_CloseAll, "&Close All\tCtrl+W", "Remove all loaded tiles");
     fileMenu->AppendSeparator();
     fileMenu->Append(wxID_EXIT, "E&xit\tAlt+F4");
@@ -761,20 +761,20 @@ void MainFrame::OnTileActivated(wxListEvent& event)
 
 void MainFrame::OnRailwayProfile(wxCommandEvent&)
 {
-    if (m_railwayPath.empty()) {
-        wxMessageBox("No railway data loaded.\n"
+    if (m_railwayPath.empty() && m_roadsPath.empty()) {
+        wxMessageBox("No transport data loaded.\n"
                      "Use File > Load Transport Data first.",
-                     "Railway Profiles", wxICON_INFORMATION | wxOK, this);
+                     "Elevation Profiles", wxICON_INFORMATION | wxOK, this);
         return;
     }
     if (m_zipPaths.empty()) {
         wxMessageBox("No DTM tiles loaded.\n"
                      "Use File > Open ZIP to load elevation data first.",
-                     "Railway Profiles", wxICON_INFORMATION | wxOK, this);
+                     "Elevation Profiles", wxICON_INFORMATION | wxOK, this);
         return;
     }
 
-    auto* view = new ProfileView(nullptr, m_railwayPath, m_zipPaths);
+    auto* view = new ProfileView(nullptr, m_railwayPath, m_roadsPath, m_zipPaths);
     view->Show();
 }
 

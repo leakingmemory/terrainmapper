@@ -542,27 +542,23 @@ ProfileResult ProfileData::BuildProfile(const std::string& railwayPath,
 
 // ─── Profile smoothing ──────────────────────────────────────────────
 //
-// Real railways use extensive earthworks (cuts through hills, fills across
-// valleys) to maintain gentle, consistent grades.  The raw DTM elevation
-// follows natural terrain, which is far too rough for a railway profile.
-//
-// We apply four passes:
-//  1. Gaussian-weighted moving average (σ ≈ 250m) to absorb local terrain
-//     roughness — simulates cuts and fills during construction.
-//  2. Forward gradient-limiting sweep: caps uphill grade at kMaxGrade.
-//  3. Backward gradient-limiting sweep: caps downhill grade at kMaxGrade.
-//  4. Vertical curve smoothing: smooth the gradient profile with a Gaussian
-//     so that grade transitions are gradual (parabolic) rather than abrupt.
-//     Real railways use vertical curves of 200-1000m radius at every grade
-//     change point.
+// Parameterized smoothing used by both railway and road profiles.
+// Four passes:
+//  1. Gaussian-weighted moving average to absorb local terrain roughness.
+//  2. Forward gradient-limiting sweep.
+//  3. Backward gradient-limiting sweep.
+//  4. Vertical curve smoothing (smooth gradient, reconstruct elevations).
 
-void ProfileData::SmoothProfile(std::vector<ProfilePoint>& points) const
+void ProfileData::SmoothWithParams(std::vector<ProfilePoint>& points,
+                                   double elevSigmaKm,
+                                   double maxGrade,
+                                   double gradeSigmaKm)
 {
     if (points.size() < 3) return;
 
-    // Helper: Gaussian-smooth an elevation profile (surface points only)
-    auto gaussianSmooth = [&](double sigmaKm) {
-        double windowKm = sigmaKm * 3.0;
+    // --- Pass 1: Gaussian elevation smoothing ---
+    {
+        double windowKm = elevSigmaKm * 3.0;
         std::vector<double> smoothed(points.size());
 
         for (size_t i = 0; i < points.size(); i++) {
@@ -571,8 +567,7 @@ void ProfileData::SmoothProfile(std::vector<ProfilePoint>& points) const
                 continue;
             }
 
-            double weightSum = 0;
-            double valueSum = 0;
+            double weightSum = 0, valueSum = 0;
             double centerKm = points[i].km;
 
             for (size_t j = 0; j < points.size(); j++) {
@@ -580,10 +575,11 @@ void ProfileData::SmoothProfile(std::vector<ProfilePoint>& points) const
                     continue;
                 double dkm = points[j].km - centerKm;
                 if (std::abs(dkm) > windowKm) {
-                    if (dkm > windowKm) break;  // sorted by km
+                    if (dkm > windowKm) break;
                     continue;
                 }
-                double w = std::exp(-0.5 * (dkm / sigmaKm) * (dkm / sigmaKm));
+                double w = std::exp(-0.5 * (dkm / elevSigmaKm) *
+                                           (dkm / elevSigmaKm));
                 weightSum += w;
                 valueSum += w * points[j].elevation;
             }
@@ -596,101 +592,69 @@ void ProfileData::SmoothProfile(std::vector<ProfilePoint>& points) const
             if (points[i].medium != 'U' && points[i].elevation > -9000)
                 points[i].elevation = smoothed[i];
         }
-    };
-
-    // --- Pass 1: Gaussian smoothing (σ = 210m) ---
-    gaussianSmooth(0.21);
+    }
 
     // --- Pass 2 & 3: Gradient limiting ---
-    // Norwegian main lines typically max out at 2.0-2.5% grade
-    // (Bergensbanen has sections at 2.1%, Flåmsbana at 5.5% but that's
-    // exceptional).  We use 2.5% as a generous upper bound.
-    constexpr double kMaxGrade = 0.025;  // 2.5% = 25‰
-
-    // Forward sweep: limit how fast elevation can rise
     for (size_t i = 1; i < points.size(); i++) {
         if (points[i].medium == 'U' || points[i].elevation < -9000) continue;
         if (points[i - 1].elevation < -9000) continue;
-
         double dkm = points[i].km - points[i - 1].km;
         if (dkm <= 0) continue;
-        double maxRise = kMaxGrade * dkm * 1000.0;  // km to metres
-
+        double maxRise = maxGrade * dkm * 1000.0;
         double diff = points[i].elevation - points[i - 1].elevation;
         if (diff > maxRise)
             points[i].elevation = points[i - 1].elevation + maxRise;
     }
 
-    // Backward sweep: limit how fast elevation can drop
     for (size_t i = points.size() - 1; i > 0; i--) {
         if (points[i - 1].medium == 'U' || points[i - 1].elevation < -9000) continue;
         if (points[i].elevation < -9000) continue;
-
         double dkm = points[i].km - points[i - 1].km;
         if (dkm <= 0) continue;
-        double maxRise = kMaxGrade * dkm * 1000.0;
-
+        double maxRise = maxGrade * dkm * 1000.0;
         double diff = points[i - 1].elevation - points[i].elevation;
         if (diff > maxRise)
             points[i - 1].elevation = points[i].elevation + maxRise;
     }
 
     // --- Pass 4: Vertical curve smoothing ---
-    // The gradient limiting can create sharp "V" and "Λ" shapes where
-    // the grade snaps from e.g. +2.5% to -2.5%.  Real railways use
-    // parabolic vertical curves (200-1000m long) at every grade change.
-    //
-    // We approximate this by smoothing the gradient profile itself:
-    //  1. Compute gradient at each point
-    //  2. Smooth gradients with Gaussian (σ = 500m ≈ typical vertical curve)
-    //  3. Reconstruct elevations from the smoothed gradients
-    //  4. Anchor the reconstructed profile to minimize drift
-
-    // Collect indices of surface points with valid elevation
     std::vector<size_t> surfIdx;
     for (size_t i = 0; i < points.size(); i++) {
         if (points[i].medium != 'U' && points[i].elevation > -9000)
             surfIdx.push_back(i);
     }
-
     if (surfIdx.size() < 3) return;
 
-    // Compute gradients between consecutive surface points (‰)
     size_t nSurf = surfIdx.size();
     std::vector<double> grades(nSurf, 0.0);
     for (size_t si = 1; si < nSurf; si++) {
         size_t i = surfIdx[si], ip = surfIdx[si - 1];
         double dkm = points[i].km - points[ip].km;
         if (dkm > 0)
-            grades[si] = (points[i].elevation - points[ip].elevation) / (dkm * 1000.0);
+            grades[si] = (points[i].elevation - points[ip].elevation) /
+                         (dkm * 1000.0);
     }
-    grades[0] = grades[1];  // extend first gradient
+    grades[0] = grades[1];
 
-    // Gaussian-smooth the gradient series (σ = 0.42 km)
-    constexpr double kGradeSigmaKm = 0.42;
-    constexpr double kGradeWindowKm = kGradeSigmaKm * 3.0;
+    double gradeWindowKm = gradeSigmaKm * 3.0;
     std::vector<double> smoothGrades(nSurf);
-
     for (size_t si = 0; si < nSurf; si++) {
         double centerKm = points[surfIdx[si]].km;
         double wSum = 0, vSum = 0;
-
         for (size_t sj = 0; sj < nSurf; sj++) {
             double dkm = points[surfIdx[sj]].km - centerKm;
-            if (std::abs(dkm) > kGradeWindowKm) {
-                if (dkm > kGradeWindowKm) break;
+            if (std::abs(dkm) > gradeWindowKm) {
+                if (dkm > gradeWindowKm) break;
                 continue;
             }
-            double w = std::exp(-0.5 * (dkm / kGradeSigmaKm) *
-                                       (dkm / kGradeSigmaKm));
+            double w = std::exp(-0.5 * (dkm / gradeSigmaKm) *
+                                       (dkm / gradeSigmaKm));
             wSum += w;
             vSum += w * grades[sj];
         }
-
         smoothGrades[si] = (wSum > 0) ? vSum / wSum : grades[si];
     }
 
-    // Reconstruct elevations from smoothed gradients, anchored at start
     std::vector<double> reconstructed(nSurf);
     reconstructed[0] = points[surfIdx[0]].elevation;
     for (size_t si = 1; si < nSurf; si++) {
@@ -699,13 +663,9 @@ void ProfileData::SmoothProfile(std::vector<ProfilePoint>& points) const
                             smoothGrades[si] * dkm * 1000.0;
     }
 
-    // Correct drift: the reconstructed profile may drift away from
-    // the gradient-limited one.  Blend to keep it close: apply a
-    // linear correction so start and end match the original.
-    double origStart = points[surfIdx[0]].elevation;
-    double origEnd   = points[surfIdx[nSurf - 1]].elevation;
-    double reconEnd  = reconstructed[nSurf - 1];
-    double drift = (origEnd - reconEnd);
+    double reconEnd = reconstructed[nSurf - 1];
+    double origEnd = points[surfIdx[nSurf - 1]].elevation;
+    double drift = origEnd - reconEnd;
     double totalKm = points[surfIdx[nSurf - 1]].km - points[surfIdx[0]].km;
 
     for (size_t si = 0; si < nSurf; si++) {
@@ -713,6 +673,12 @@ void ProfileData::SmoothProfile(std::vector<ProfilePoint>& points) const
             (points[surfIdx[si]].km - points[surfIdx[0]].km) / totalKm : 0;
         points[surfIdx[si]].elevation = reconstructed[si] + drift * frac;
     }
+}
+
+// Railway-specific wrapper: uses railway smoothing parameters
+void ProfileData::SmoothProfile(std::vector<ProfilePoint>& points) const
+{
+    SmoothWithParams(points, 0.21, 0.025, 0.42);
 }
 
 // ─── Tunnel interpolation ───────────────────────────────────────────

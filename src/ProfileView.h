@@ -1,6 +1,7 @@
 #pragma once
 
 #include "ProfileData.h"
+#include "RoadProfileData.h"
 
 #include <wx/wx.h>
 #include <wx/scrolwin.h>
@@ -12,17 +13,31 @@ class ProfileView : public wxFrame {
 public:
     ProfileView(wxWindow* parent,
                 const std::string& railwayPath,
+                const std::string& roadsPath,
                 const std::vector<std::string>& zipPaths);
 
 private:
+    enum class Mode { Railway, Road };
+    Mode m_mode = Mode::Railway;
+
     ProfileData m_profileData;
+    RoadProfileData m_roadProfileData;
     std::string m_railwayPath;
+    std::string m_roadsPath;
+
+    // Railway data
     std::vector<std::string> m_lineNames;
-    ProfileResult m_result;
+    ProfileResult m_railResult;
+
+    // Road data
+    std::vector<RoadId> m_roadList;
+    RoadProfileResult m_roadResult;
+
     bool m_hasProfile = false;
     bool m_indexReady = false;
 
     // UI elements
+    wxChoice* m_modeChoice = nullptr;
     wxChoice* m_lineChoice = nullptr;
     wxButton* m_showBtn = nullptr;
     wxScrolledCanvas* m_canvas = nullptr;
@@ -33,10 +48,15 @@ private:
     wxStaticText* m_lblElevRange = nullptr;
     wxStaticText* m_lblClimb = nullptr;
     wxStaticText* m_lblMaxGrade = nullptr;
-    wxStaticText* m_lblTunnel = nullptr;
-    wxStaticText* m_lblBridge = nullptr;
+    wxStaticText* m_lblExtra1 = nullptr;       // tunnel/rail crossings
+    wxStaticText* m_lblExtra2 = nullptr;       // bridge/road crossings
     wxStaticText* m_lblStations = nullptr;
     wxStaticText* m_lblSegments = nullptr;
+
+    // Extra stat labels (the label text itself, not the value)
+    wxStaticText* m_lblExtra1Label = nullptr;
+    wxStaticText* m_lblExtra2Label = nullptr;
+    wxStaticText* m_lblStationsLabel = nullptr;
 
     // Diagram layout constants
     static constexpr int kMarginLeft = 70;
@@ -50,10 +70,15 @@ private:
     double m_mouseKm = -1;
     double m_mouseElev = -1;
 
+    void OnModeChanged(wxCommandEvent& event);
     void OnShowProfile(wxCommandEvent& event);
     void OnPaint(wxPaintEvent& event);
     void OnMouseMove(wxMouseEvent& event);
     void UpdateStats();
+    void PopulateLineChoice();
+
+    // Current profile points (shared between modes)
+    const std::vector<ProfilePoint>& CurrentPoints() const;
 
     // Coordinate conversion helpers for diagram
     int KmToX(double km) const;

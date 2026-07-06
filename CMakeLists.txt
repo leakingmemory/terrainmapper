@@ -18,6 +18,7 @@ add_executable(terrainmapper
     src/MapView.cpp
     src/ProfileData.cpp
     src/ProfileView.cpp
+    src/RoadProfileData.cpp
 )
 
 target_include_directories(terrainmapper PRIVATE

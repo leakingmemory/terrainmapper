@@ -83,6 +83,17 @@ public:
     ProfileResult BuildProfile(const std::string& railwayPath,
                                const std::string& lineName) const;
 
+    // Sample elevation at an EPSG:25833 coordinate
+    // Returns false if no tile covers the point
+    bool SampleElevation(double x25833, double y25833, float& elevOut) const;
+
+    // Parameterized smoothing: Gaussian terrain smoothing + gradient limiting
+    // + vertical curve smoothing.  Used by both railway and road profiles.
+    static void SmoothWithParams(std::vector<ProfilePoint>& points,
+                                 double elevSigmaKm,
+                                 double maxGrade,
+                                 double gradeSigmaKm);
+
 private:
     std::vector<TileIndexEntry> m_tileIndex;
 
@@ -90,18 +101,11 @@ private:
     mutable std::vector<CachedTile> m_tileCache;
     static constexpr int kMaxCachedTiles = 8;
 
-    // Sample elevation at an EPSG:25833 coordinate
-    // Returns false if no tile covers the point
-    bool SampleElevation(double x25833, double y25833, float& elevOut) const;
-
     // Load a tile's raster data into cache, evicting LRU if needed
     const CachedTile* LoadTileIntoCache(int tileIdx) const;
 
-    // Smooth raw DTM samples to simulate railway earthworks (cuts/fills)
-    // and apply gradient constraints
+    // Railway-specific: smooth + tunnel interpolation
     void SmoothProfile(std::vector<ProfilePoint>& points) const;
-
-    // Interpolate elevation through tunnel sections
     void InterpolateTunnels(std::vector<ProfilePoint>& points) const;
 
     // Compute stats from assembled profile
