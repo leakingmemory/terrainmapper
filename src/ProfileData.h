@@ -23,6 +23,25 @@ struct ProfileStation {
     char type;          // S=station, I=interchange
 };
 
+struct TrackJunction {
+    double km;            // distance along the profiled line
+    double elevation;     // from profile
+    double x, y;          // EPSG:25833 coordinate
+    enum class Type {
+        Switch,           // 3 ways — single turnout
+        DoubleSwitch,     // 4+ ways with small divergence — crossover
+        DiamondCrossing,  // 4+ ways with large angle — tracks cross
+        Overpass,         // this line goes over another track
+        Underpass,        // this line goes under another track
+        RoadLevelCrossing,  // road at grade
+        RoadOverpass,     // road goes over railway
+        RoadUnderpass,    // road goes under railway
+    };
+    Type type;
+    std::string description;  // other line name or road ID
+    int numSwitches = 0;
+};
+
 struct ProfileStats {
     std::string lineName;
     double totalLengthKm;
@@ -46,6 +65,7 @@ struct TileIndexEntry {
 struct ProfileResult {
     std::vector<ProfilePoint> points;
     std::vector<ProfileStation> stations;
+    std::vector<TrackJunction> junctions;
     ProfileStats stats;
 };
 
@@ -79,9 +99,14 @@ public:
     // Get list of distinct line names from the railway GML
     std::vector<std::string> GetLineNames(const std::string& railwayPath) const;
 
+    // Progress callback: (percentage 0-100, stage description) → continue?
+    using ProgressCb = std::function<bool(int pct, const std::string& msg)>;
+
     // Build a profile for the named line
     ProfileResult BuildProfile(const std::string& railwayPath,
-                               const std::string& lineName) const;
+                               const std::string& roadsPath,
+                               const std::string& lineName,
+                               ProgressCb progress = nullptr) const;
 
     // Sample elevation at an EPSG:25833 coordinate
     // Returns false if no tile covers the point
@@ -112,4 +137,11 @@ private:
     ProfileStats ComputeStats(const std::string& lineName,
                               const std::vector<ProfilePoint>& points,
                               const std::vector<ProfileStation>& stations) const;
+
+    // Find track junctions and road crossings along the profiled line
+    std::vector<TrackJunction> FindTrackJunctions(
+        const std::string& railwayPath,
+        const std::string& roadsPath,
+        const std::string& lineName,
+        const std::vector<ProfilePoint>& points) const;
 };

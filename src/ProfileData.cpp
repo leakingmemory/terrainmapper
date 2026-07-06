@@ -11,6 +11,7 @@
 #include <cmath>
 #include <map>
 #include <set>
+#include <unordered_map>
 
 // ─── CachedTile lifecycle ───────────────────────────────────────────
 
@@ -308,8 +309,13 @@ bool ProfileData::SampleElevation(double x25833, double y25833, float& elevOut) 
 // ─── Profile building ───────────────────────────────────────────────
 
 ProfileResult ProfileData::BuildProfile(const std::string& railwayPath,
-                                         const std::string& lineName) const
+                                         const std::string& roadsPath,
+                                         const std::string& lineName,
+                                         ProgressCb progress) const
 {
+    auto report = [&](int pct, const std::string& msg) {
+        if (progress) progress(pct, msg);
+    };
     ProfileResult result;
     result.stats.lineName = lineName;
 
@@ -317,6 +323,8 @@ ProfileResult ProfileData::BuildProfile(const std::string& railwayPath,
         GDALOpenEx(railwayPath.c_str(), GDAL_OF_VECTOR | GDAL_OF_READONLY,
                    nullptr, nullptr, nullptr));
     if (!ds) return result;
+
+    report(0, "Loading track segments...");
 
     // --- Collect segments for this line ---
     struct RawSegment {
@@ -392,8 +400,10 @@ ProfileResult ProfileData::BuildProfile(const std::string& railwayPath,
     }
 
     // --- Densify and sample elevation ---
+    report(5, "Sampling elevation...");
     constexpr double kDensifySpacing = 50.0;  // metres between sample points
 
+    int segsDone = 0;
     for (const auto& seg : segments) {
         if (seg.coords.size() < 2) continue;
 
@@ -449,6 +459,12 @@ ProfileResult ProfileData::BuildProfile(const std::string& railwayPath,
 
             result.points.push_back(pt);
         }
+
+        segsDone++;
+        if (segsDone % 50 == 0 || segsDone == static_cast<int>(segments.size()))
+            report(5 + 60 * segsDone / static_cast<int>(segments.size()),
+                   "Sampling elevation... (" + std::to_string(segsDone) + "/" +
+                   std::to_string(segments.size()) + " segments)");
     }
 
     // Sort all points by km
@@ -513,10 +529,14 @@ ProfileResult ProfileData::BuildProfile(const std::string& railwayPath,
 
     GDALClose(ds);
 
+    report(68, "Smoothing profile...");
+
     // --- Smooth surface sections to simulate railway earthworks ---
     // Must happen before tunnel interpolation so tunnel portals use
     // the smoothed track elevation, not raw DTM surface elevation
     SmoothProfile(result.points);
+
+    report(72, "Interpolating tunnels...");
 
     // --- Tunnel interpolation ---
     InterpolateTunnels(result.points);
@@ -534,8 +554,16 @@ ProfileResult ProfileData::BuildProfile(const std::string& railwayPath,
         }
     }
 
+    report(78, "Computing statistics...");
+
     // --- Compute stats ---
     result.stats = ComputeStats(lineName, result.points, result.stations);
+
+    report(82, "Finding junctions and crossings...");
+
+    // --- Find junctions and crossings ---
+    result.junctions = FindTrackJunctions(railwayPath, roadsPath, lineName,
+                                          result.points);
 
     return result;
 }
@@ -802,4 +830,614 @@ ProfileStats ProfileData::ComputeStats(const std::string& lineName,
     if (s.maxElev < -1e8) s.maxElev = 0;
 
     return s;
+}
+
+// ─── Junction and crossing detection ───────────────────────────────
+
+namespace {
+
+// 2D segment intersection test — returns true with parameter tA on seg A
+bool SegIntersect2D(double a1x, double a1y, double a2x, double a2y,
+                    double b1x, double b1y, double b2x, double b2y,
+                    double& tA)
+{
+    double dx = a2x - a1x, dy = a2y - a1y;
+    double ex = b2x - b1x, ey = b2y - b1y;
+    double denom = dx * ey - dy * ex;
+    if (std::abs(denom) < 1e-12) return false;
+    double fx = b1x - a1x, fy = b1y - a1y;
+    tA = (fx * ey - fy * ex) / denom;
+    double tB = (fx * dy - fy * dx) / denom;
+    return tA >= 0 && tA <= 1 && tB >= 0 && tB <= 1;
+}
+
+} // anon
+
+std::vector<TrackJunction> ProfileData::FindTrackJunctions(
+    const std::string& railwayPath,
+    const std::string& roadsPath,
+    const std::string& lineName,
+    const std::vector<ProfilePoint>& points) const
+{
+    std::vector<TrackJunction> result;
+    if (points.empty()) return result;
+
+    // Helper: find km and elevation on the profile nearest to (px, py)
+    auto findOnProfile = [&](double px, double py)
+        -> std::tuple<double, double, char> {
+        double bestD2 = 1e18;
+        double km = 0, elev = 0;
+        char medium = ' ';
+        for (const auto& pt : points) {
+            double dx = pt.x - px, dy = pt.y - py;
+            double d2 = dx * dx + dy * dy;
+            if (d2 < bestD2) {
+                bestD2 = d2;
+                km = pt.km;
+                elev = pt.elevation;
+                medium = pt.medium;
+            }
+        }
+        return {km, elev, medium};
+    };
+
+    // ── Part A: Track-track junctions ──
+
+    GDALDataset* ds = static_cast<GDALDataset*>(
+        GDALOpenEx(railwayPath.c_str(), GDAL_OF_VECTOR | GDAL_OF_READONLY,
+                   nullptr, nullptr, nullptr));
+    if (!ds) return result;
+
+    OGRLayer* tracks = ds->GetLayerByName("Banelenke");
+    if (!tracks) { GDALClose(ds); return result; }
+
+    // Load all active track segments
+    struct TrackSeg {
+        std::string lineName;
+        char medium;
+        std::vector<std::pair<double, double>> coords;
+    };
+    std::vector<TrackSeg> allSegs;
+
+    tracks->SetAttributeFilter("banestatus = 'I'");
+    tracks->ResetReading();
+    OGRFeature* feat;
+    while ((feat = tracks->GetNextFeature()) != nullptr) {
+        OGRGeometry* geom = feat->GetGeometryRef();
+        if (!geom) { OGRFeature::DestroyFeature(feat); continue; }
+
+        const char* name = feat->GetFieldAsString("banenavn");
+        const char* medField = feat->GetFieldAsString("medium");
+        char medium = (medField && medField[0]) ? medField[0] : ' ';
+
+        auto processLine = [&](OGRLineString* line) {
+            TrackSeg seg;
+            seg.lineName = name ? name : "";
+            seg.medium = medium;
+            int nPts = line->getNumPoints();
+            for (int p = 0; p < nPts; p++)
+                seg.coords.push_back({line->getX(p), line->getY(p)});
+            if (seg.coords.size() >= 2)
+                allSegs.push_back(std::move(seg));
+        };
+
+        OGRwkbGeometryType gtype = wkbFlatten(geom->getGeometryType());
+        if (gtype == wkbLineString)
+            processLine(static_cast<OGRLineString*>(geom));
+        else if (gtype == wkbMultiLineString) {
+            auto* multi = static_cast<OGRMultiLineString*>(geom);
+            for (int g = 0; g < multi->getNumGeometries(); g++)
+                processLine(static_cast<OGRLineString*>(
+                    multi->getGeometryRef(g)));
+        }
+        OGRFeature::DestroyFeature(feat);
+    }
+
+    GDALClose(ds);
+
+    // Deduplicate segments — the GML data contains each segment twice.
+    // Two segments are duplicates if they share the same line name, medium,
+    // and their start/end coordinates match within tolerance.
+    {
+        constexpr double kDupTol2 = 1.0;  // 1m²
+        auto isDup = [&](const TrackSeg& a, const TrackSeg& b) {
+            if (a.lineName != b.lineName || a.medium != b.medium) return false;
+            if (a.coords.size() != b.coords.size()) return false;
+            double dsx = a.coords.front().first - b.coords.front().first;
+            double dsy = a.coords.front().second - b.coords.front().second;
+            double dex = a.coords.back().first - b.coords.back().first;
+            double dey = a.coords.back().second - b.coords.back().second;
+            return (dsx*dsx + dsy*dsy < kDupTol2) &&
+                   (dex*dex + dey*dey < kDupTol2);
+        };
+
+        std::vector<TrackSeg> unique;
+        unique.reserve(allSegs.size());
+        for (auto& seg : allSegs) {
+            bool dup = false;
+            for (const auto& u : unique) {
+                if (isDup(seg, u)) { dup = true; break; }
+            }
+            if (!dup)
+                unique.push_back(std::move(seg));
+        }
+        allSegs = std::move(unique);
+    }
+
+    // Build spatial hash of endpoints
+    constexpr double kNodeTol = 10.0;
+    constexpr double kNodeCell = 10.0;
+
+    struct NodeEntry { int segIdx; bool isEnd; double x, y; };
+    std::unordered_map<int64_t, std::vector<NodeEntry>> nodeHash;
+
+    auto nodeKey = [](double x, double y) -> int64_t {
+        int gx = static_cast<int>(std::floor(x / kNodeCell));
+        int gy = static_cast<int>(std::floor(y / kNodeCell));
+        return static_cast<int64_t>(gx) * 10000007LL + gy;
+    };
+
+    for (int i = 0; i < static_cast<int>(allSegs.size()); i++) {
+        auto& s = allSegs[i];
+        auto& front = s.coords.front();
+        auto& back = s.coords.back();
+        nodeHash[nodeKey(front.first, front.second)].push_back(
+            {i, false, front.first, front.second});
+        nodeHash[nodeKey(back.first, back.second)].push_back(
+            {i, true, back.first, back.second});
+    }
+
+    auto queryNode = [&](double x, double y) -> std::vector<NodeEntry> {
+        std::vector<NodeEntry> hits;
+        int cx = static_cast<int>(std::floor(x / kNodeCell));
+        int cy = static_cast<int>(std::floor(y / kNodeCell));
+        double tol2 = kNodeTol * kNodeTol;
+        for (int dx = -1; dx <= 1; dx++) {
+            for (int dy = -1; dy <= 1; dy++) {
+                int64_t k = static_cast<int64_t>(cx + dx) * 10000007LL + (cy + dy);
+                auto it = nodeHash.find(k);
+                if (it == nodeHash.end()) continue;
+                for (auto& e : it->second) {
+                    double ddx = e.x - x, ddy = e.y - y;
+                    if (ddx * ddx + ddy * ddy <= tol2)
+                        hits.push_back(e);
+                }
+            }
+        }
+        return hits;
+    };
+
+    // For each endpoint of our line's segments, check for junctions
+    std::set<int64_t> processedNodes;  // avoid duplicate junctions at same spot
+
+    for (int si = 0; si < static_cast<int>(allSegs.size()); si++) {
+        if (allSegs[si].lineName != lineName) continue;
+
+        for (int endpt = 0; endpt < 2; endpt++) {
+            bool isEnd = (endpt == 1);
+            auto& ep = isEnd ? allSegs[si].coords.back()
+                             : allSegs[si].coords.front();
+
+            // Check if we already processed this node
+            int64_t nk = nodeKey(ep.first, ep.second);
+            if (processedNodes.count(nk)) continue;
+            processedNodes.insert(nk);
+
+            auto neighbors = queryNode(ep.first, ep.second);
+            if (neighbors.size() <= 2) continue;  // just continuation
+
+            // Collect unique segments at this node
+            std::set<int> segSet;
+            for (auto& n : neighbors) segSet.insert(n.segIdx);
+            int ways = static_cast<int>(segSet.size());
+            if (ways <= 2) continue;
+
+            // Check mediums at this node
+            std::set<char> mediums;
+            std::set<std::string> otherLines;
+            bool ourLineHere = false;
+            char ourMedium = ' ';
+
+            for (int idx : segSet) {
+                mediums.insert(allSegs[idx].medium);
+                if (allSegs[idx].lineName == lineName) {
+                    ourLineHere = true;
+                    ourMedium = allSegs[idx].medium;
+                } else {
+                    otherLines.insert(allSegs[idx].lineName);
+                }
+            }
+            if (!ourLineHere) continue;
+
+            auto [km, elev, profMedium] = findOnProfile(ep.first, ep.second);
+
+            // Check if there's a grade separation
+            bool gradeSeparated = false;
+            for (int idx : segSet) {
+                if (allSegs[idx].lineName == lineName) continue;
+                char otherMed = allSegs[idx].medium;
+                // Different medium = grade separated
+                if ((ourMedium == 'U' || ourMedium == 'T') && otherMed == ' ') {
+                    gradeSeparated = true;
+                    break;
+                }
+                if (ourMedium == ' ' && (otherMed == 'U' || otherMed == 'T')) {
+                    gradeSeparated = true;
+                    break;
+                }
+                if ((ourMedium == 'L' || ourMedium == 'B') && otherMed == ' ') {
+                    gradeSeparated = true;
+                    break;
+                }
+                if (ourMedium == ' ' && (otherMed == 'L' || otherMed == 'B')) {
+                    gradeSeparated = true;
+                    break;
+                }
+            }
+
+            // Build description
+            std::string desc;
+            for (auto& ol : otherLines) {
+                if (!desc.empty()) desc += ", ";
+                desc += ol;
+            }
+
+            if (gradeSeparated) {
+                TrackJunction jn;
+                jn.km = km;
+                jn.elevation = elev;
+                jn.x = ep.first;
+                jn.y = ep.second;
+                if (ourMedium == 'U' || ourMedium == 'T')
+                    jn.type = TrackJunction::Type::Underpass;
+                else if (ourMedium == 'L' || ourMedium == 'B')
+                    jn.type = TrackJunction::Type::Overpass;
+                else
+                    jn.type = TrackJunction::Type::Overpass;  // other is under
+                jn.description = desc;
+                result.push_back(jn);
+                continue;
+            }
+
+            // Same level — classify by angles.
+            // Compute direction vectors for each segment at this node,
+            // then cluster nearby directions so that multiple segments
+            // heading the same way count as one "route".
+            std::vector<std::pair<double, double>> rawDirs;
+            for (int idx : segSet) {
+                auto& seg = allSegs[idx];
+                double fx = seg.coords.front().first, fy = seg.coords.front().second;
+                double dfx = fx - ep.first, dfy = fy - ep.second;
+                bool frontNear = (dfx*dfx + dfy*dfy < kNodeTol*kNodeTol);
+
+                double targetDist = 50.0;
+                double dirX = 0, dirY = 0;
+
+                if (frontNear) {
+                    double cumDist = 0;
+                    for (size_t j = 1; j < seg.coords.size(); j++) {
+                        double dx = seg.coords[j].first - seg.coords[j-1].first;
+                        double dy = seg.coords[j].second - seg.coords[j-1].second;
+                        cumDist += std::sqrt(dx*dx + dy*dy);
+                        if (cumDist >= targetDist || j == seg.coords.size() - 1) {
+                            dirX = seg.coords[j].first - ep.first;
+                            dirY = seg.coords[j].second - ep.second;
+                            break;
+                        }
+                    }
+                } else {
+                    double cumDist = 0;
+                    for (int j = static_cast<int>(seg.coords.size()) - 2; j >= 0; j--) {
+                        double dx = seg.coords[j+1].first - seg.coords[j].first;
+                        double dy = seg.coords[j+1].second - seg.coords[j].second;
+                        cumDist += std::sqrt(dx*dx + dy*dy);
+                        if (cumDist >= targetDist || j == 0) {
+                            dirX = seg.coords[j].first - ep.first;
+                            dirY = seg.coords[j].second - ep.second;
+                            break;
+                        }
+                    }
+                }
+
+                double len = std::sqrt(dirX*dirX + dirY*dirY);
+                if (len > 0) { dirX /= len; dirY /= len; }
+                rawDirs.push_back({dirX, dirY});
+            }
+
+            // Cluster directions within 20° of each other (dot > 0.94)
+            // so that multiple segments heading the same way = one route
+            constexpr double kClusterDot = 0.94;  // cos(20°) ≈ 0.94
+            std::vector<std::pair<double, double>> clustered;
+            std::vector<bool> assigned(rawDirs.size(), false);
+
+            for (size_t i = 0; i < rawDirs.size(); i++) {
+                if (assigned[i]) continue;
+                assigned[i] = true;
+                double cx = rawDirs[i].first, cy = rawDirs[i].second;
+                int cnt = 1;
+                for (size_t j = i + 1; j < rawDirs.size(); j++) {
+                    if (assigned[j]) continue;
+                    double dot = cx * rawDirs[j].first + cy * rawDirs[j].second;
+                    if (dot > kClusterDot) {
+                        cx += rawDirs[j].first;
+                        cy += rawDirs[j].second;
+                        cnt++;
+                        assigned[j] = true;
+                    }
+                }
+                double len = std::sqrt(cx*cx + cy*cy);
+                if (len > 0) { cx /= len; cy /= len; }
+                clustered.push_back({cx, cy});
+            }
+
+            int effectiveWays = static_cast<int>(clustered.size());
+            if (effectiveWays <= 2) continue;  // just continuation
+
+            TrackJunction jn;
+            jn.km = km;
+            jn.elevation = elev;
+            jn.x = ep.first;
+            jn.y = ep.second;
+            jn.description = desc;
+
+            if (effectiveWays == 3) {
+                jn.type = TrackJunction::Type::Switch;
+                jn.numSwitches = 1;
+            } else {
+                // 4+ distinct directions: check for diamond crossing
+                // (two independent through-routes crossing at >30°)
+                // vs multiple switches (diverging tracks off one through-route)
+
+                // Find through-route pairs (roughly opposing, dot < -0.85)
+                struct ThroughRoute {
+                    double axisX, axisY;
+                };
+                std::vector<ThroughRoute> throughRoutes;
+                std::vector<bool> paired(clustered.size(), false);
+
+                for (size_t a = 0; a < clustered.size(); a++) {
+                    if (paired[a]) continue;
+                    double bestDot = 0;
+                    size_t bestB = a;
+                    for (size_t b = a + 1; b < clustered.size(); b++) {
+                        if (paired[b]) continue;
+                        double dot = clustered[a].first * clustered[b].first +
+                                     clustered[a].second * clustered[b].second;
+                        if (dot < bestDot) { bestDot = dot; bestB = b; }
+                    }
+                    if (bestDot < -0.85 && bestB != a) {
+                        paired[a] = paired[bestB] = true;
+                        throughRoutes.push_back({clustered[a].first,
+                                                 clustered[a].second});
+                    }
+                }
+
+                bool isDiamond = false;
+                if (throughRoutes.size() >= 2) {
+                    double dot = throughRoutes[0].axisX * throughRoutes[1].axisX +
+                                 throughRoutes[0].axisY * throughRoutes[1].axisY;
+                    double crossAngle = std::acos(
+                        std::clamp(std::abs(dot), 0.0, 1.0));
+                    if (crossAngle > 30.0 * M_PI / 180.0)
+                        isDiamond = true;
+                }
+
+                if (isDiamond) {
+                    jn.type = TrackJunction::Type::DiamondCrossing;
+                    jn.numSwitches = 0;
+                } else {
+                    // Count switches: each extra direction beyond the
+                    // through-route is one switch
+                    jn.type = (effectiveWays == 4)
+                        ? TrackJunction::Type::DoubleSwitch
+                        : TrackJunction::Type::Switch;
+                    jn.numSwitches = effectiveWays - 2;
+                }
+            }
+
+            result.push_back(jn);
+        }
+    }
+
+    // ── Part B: Road-railway crossings ──
+
+    if (!roadsPath.empty()) {
+        // Compute bounding box of the profile
+        double bboxMinX = 1e18, bboxMinY = 1e18;
+        double bboxMaxX = -1e18, bboxMaxY = -1e18;
+        for (const auto& pt : points) {
+            bboxMinX = std::min(bboxMinX, pt.x);
+            bboxMaxX = std::max(bboxMaxX, pt.x);
+            bboxMinY = std::min(bboxMinY, pt.y);
+            bboxMaxY = std::max(bboxMaxY, pt.y);
+        }
+        constexpr double kPad = 200.0;
+        bboxMinX -= kPad; bboxMinY -= kPad;
+        bboxMaxX += kPad; bboxMaxY += kPad;
+
+        // Build polyline segments from profile for intersection testing
+        // Use a subset of profile points (every ~200m) for efficiency
+        struct RailSeg {
+            double x1, y1, x2, y2;
+            double km1, km2;
+        };
+        std::vector<RailSeg> railSegs;
+        for (size_t i = 1; i < points.size(); i++) {
+            if (points[i].km - points[i-1].km > 1.0) continue;
+            railSegs.push_back({points[i-1].x, points[i-1].y,
+                                points[i].x, points[i].y,
+                                points[i-1].km, points[i].km});
+        }
+
+        GDALDataset* roadDs = static_cast<GDALDataset*>(
+            GDALOpenEx(roadsPath.c_str(), GDAL_OF_VECTOR | GDAL_OF_READONLY,
+                       nullptr, nullptr, nullptr));
+        if (roadDs) {
+            OGRLayer* roads = roadDs->GetLayerByName("roads");
+            if (roads) {
+                const OGRSpatialReference* roadSrs = roads->GetSpatialRef();
+                OGRSpatialReference srs25833;
+                srs25833.importFromEPSG(25833);
+                srs25833.SetAxisMappingStrategy(OAMS_TRADITIONAL_GIS_ORDER);
+
+                OGRCoordinateTransformation* toUniform = nullptr;
+                if (roadSrs) {
+                    OGRSpatialReference src(*roadSrs);
+                    src.SetAxisMappingStrategy(OAMS_TRADITIONAL_GIS_ORDER);
+                    if (!src.IsSame(&srs25833))
+                        toUniform = OGRCreateCoordinateTransformation(&src, &srs25833);
+                }
+
+                // Set spatial filter
+                if (toUniform) {
+                    OGRSpatialReference src25833(srs25833);
+                    OGRSpatialReference roadCrs(*roadSrs);
+                    roadCrs.SetAxisMappingStrategy(OAMS_TRADITIONAL_GIS_ORDER);
+                    OGRCoordinateTransformation* fromUniform =
+                        OGRCreateCoordinateTransformation(&src25833, &roadCrs);
+                    if (fromUniform) {
+                        double x1 = bboxMinX, y1 = bboxMinY;
+                        double x2 = bboxMaxX, y2 = bboxMaxY;
+                        fromUniform->Transform(1, &x1, &y1);
+                        fromUniform->Transform(1, &x2, &y2);
+                        roads->SetSpatialFilterRect(
+                            std::min(x1, x2), std::min(y1, y2),
+                            std::max(x1, x2), std::max(y1, y2));
+                        OCTDestroyCoordinateTransformation(fromUniform);
+                    }
+                } else {
+                    roads->SetSpatialFilterRect(bboxMinX, bboxMinY,
+                                                 bboxMaxX, bboxMaxY);
+                }
+
+                // Only E/R/F roads for intersection markers
+                roads->SetAttributeFilter(
+                    "vegkategori IN ('E','R','F')");
+
+                // Track hits for deduplication
+                struct CrossingKey {
+                    char kat; int num;
+                    bool operator<(const CrossingKey& o) const {
+                        return kat != o.kat ? kat < o.kat : num < o.num;
+                    }
+                };
+                std::map<CrossingKey, std::vector<TrackJunction>> roadHits;
+
+                roads->ResetReading();
+                OGRFeature* rfeat;
+                while ((rfeat = roads->GetNextFeature()) != nullptr) {
+                    OGRGeometry* geom = rfeat->GetGeometryRef();
+                    if (!geom || wkbFlatten(geom->getGeometryType()) != wkbLineString) {
+                        OGRFeature::DestroyFeature(rfeat);
+                        continue;
+                    }
+
+                    const char* kat = rfeat->GetFieldAsString("vegkategori");
+                    int num = rfeat->GetFieldAsInteger("vegnummer");
+                    char katC = (kat && kat[0]) ? kat[0] : '?';
+                    std::string roadLabel;
+                    switch (katC) {
+                        case 'E': roadLabel = "E" + std::to_string(num); break;
+                        case 'R': roadLabel = "Rv" + std::to_string(num); break;
+                        default: roadLabel = "Fv" + std::to_string(num); break;
+                    }
+
+                    OGRLineString* line = static_cast<OGRLineString*>(geom->clone());
+                    if (toUniform)
+                        line->transform(toUniform);
+
+                    int nPts = line->getNumPoints();
+                    for (int p = 0; p + 1 < nPts; p++) {
+                        double bx1 = line->getX(p), by1 = line->getY(p);
+                        double bz1 = line->getZ(p);
+                        double bx2 = line->getX(p + 1), by2 = line->getY(p + 1);
+                        double bz2 = line->getZ(p + 1);
+
+                        for (const auto& rs : railSegs) {
+                            double tA;
+                            if (!SegIntersect2D(rs.x1, rs.y1, rs.x2, rs.y2,
+                                                bx1, by1, bx2, by2, tA))
+                                continue;
+
+                            double km = rs.km1 + tA * (rs.km2 - rs.km1);
+                            double ix = rs.x1 + tA * (rs.x2 - rs.x1);
+                            double iy = rs.y1 + tA * (rs.y2 - rs.y1);
+
+                            // Road Z at intersection
+                            // tB parameter on road segment
+                            double rdx = bx2 - bx1, rdy = by2 - by1;
+                            double denom = (rs.x2-rs.x1)*(by2-by1) - (rs.y2-rs.y1)*(bx2-bx1);
+                            double tB = 0.5;
+                            if (std::abs(denom) > 1e-12) {
+                                double fx = bx1 - rs.x1, fy = by1 - rs.y1;
+                                tB = (fx*(rs.y2-rs.y1) - fy*(rs.x2-rs.x1)) / denom;
+                                tB = std::clamp(tB, 0.0, 1.0);
+                            }
+                            double roadZ = bz1 + tB * (bz2 - bz1);
+
+                            // Railway elevation and medium at this km
+                            auto [rkm, railElev, railMed] =
+                                findOnProfile(ix, iy);
+
+                            TrackJunction jn;
+                            jn.km = km;
+                            jn.elevation = railElev;
+                            jn.x = ix;
+                            jn.y = iy;
+                            jn.description = roadLabel;
+
+                            // Classify crossing type
+                            if (railMed == 'U' || railMed == 'T') {
+                                jn.type = TrackJunction::Type::RoadOverpass;
+                            } else if (railMed == 'L' || railMed == 'B') {
+                                jn.type = TrackJunction::Type::RoadUnderpass;
+                            } else {
+                                double diff = roadZ - railElev;
+                                if (std::abs(diff) < 5.0)
+                                    jn.type = TrackJunction::Type::RoadLevelCrossing;
+                                else if (diff > 0)
+                                    jn.type = TrackJunction::Type::RoadOverpass;
+                                else
+                                    jn.type = TrackJunction::Type::RoadUnderpass;
+                            }
+
+                            CrossingKey key{katC, num};
+                            roadHits[key].push_back(jn);
+                        }
+                    }
+
+                    delete line;
+                    OGRFeature::DestroyFeature(rfeat);
+                }
+
+                if (toUniform)
+                    OCTDestroyCoordinateTransformation(toUniform);
+
+                // Deduplicate within 0.2 km
+                for (auto& [key, hits] : roadHits) {
+                    std::sort(hits.begin(), hits.end(),
+                              [](const TrackJunction& a, const TrackJunction& b) {
+                                  return a.km < b.km;
+                              });
+                    size_t i = 0;
+                    while (i < hits.size()) {
+                        size_t j = i + 1;
+                        while (j < hits.size() && hits[j].km - hits[i].km < 0.2)
+                            j++;
+                        result.push_back(hits[i + (j - i) / 2]);
+                        i = j;
+                    }
+                }
+            }
+            GDALClose(roadDs);
+        }
+    }
+
+    // Sort all junctions by km
+    std::sort(result.begin(), result.end(),
+              [](const TrackJunction& a, const TrackJunction& b) {
+                  return a.km < b.km;
+              });
+
+    return result;
 }

@@ -485,12 +485,14 @@ std::vector<RoadIntersection> RoadProfileData::FindIntersections(
     };
 
     // Helper: test a foreign linestring against our chain
+    // onHit receives: km along our chain, intersection x/y, Z of foreign line at crossing
     auto testLine = [&](OGRLineString* line,
-                        const std::function<void(double km, double ix, double iy)>& onHit) {
+                        const std::function<void(double km, double ix, double iy,
+                                                 double foreignZ)>& onHit) {
         int nPts = line->getNumPoints();
         for (int p = 0; p + 1 < nPts; p++) {
-            double bx1 = line->getX(p), by1 = line->getY(p);
-            double bx2 = line->getX(p + 1), by2 = line->getY(p + 1);
+            double bx1 = line->getX(p), by1 = line->getY(p), bz1 = line->getZ(p);
+            double bx2 = line->getX(p + 1), by2 = line->getY(p + 1), bz2 = line->getZ(p + 1);
 
             // Quick bbox reject
             double segMinX = std::min(bx1, bx2), segMaxX = std::max(bx1, bx2);
@@ -510,7 +512,22 @@ std::vector<RoadIntersection> RoadProfileData::FindIntersections(
                         tA * (chainedCoords[ci + 1].first - chainedCoords[ci].first);
                     double iy = chainedCoords[ci].second +
                         tA * (chainedCoords[ci + 1].second - chainedCoords[ci].second);
-                    onHit(km, ix, iy);
+
+                    // Compute tB on the foreign segment for Z interpolation
+                    double fdx = bx2 - bx1, fdy = by2 - by1;
+                    double denom = (chainedCoords[ci+1].first - chainedCoords[ci].first) * fdy
+                                 - (chainedCoords[ci+1].second - chainedCoords[ci].second) * fdx;
+                    double tB = 0.5;
+                    if (std::abs(denom) > 1e-12) {
+                        double gx = bx1 - chainedCoords[ci].first;
+                        double gy = by1 - chainedCoords[ci].second;
+                        tB = (gx * (chainedCoords[ci+1].second - chainedCoords[ci].second)
+                            - gy * (chainedCoords[ci+1].first - chainedCoords[ci].first)) / denom;
+                        tB = std::clamp(tB, 0.0, 1.0);
+                    }
+                    double fZ = bz1 + tB * (bz2 - bz1);
+
+                    onHit(km, ix, iy, fZ);
                 }
             }
         }
@@ -619,7 +636,8 @@ std::vector<RoadIntersection> RoadProfileData::FindIntersections(
                     RoadId crossId{katC, num};
                     CrossingKey key{katC, num};
 
-                    testLine(line, [&](double km, double ix, double iy) {
+                    testLine(line, [&](double km, double ix, double iy,
+                                        double foreignZ) {
                         RoadIntersection ri;
                         ri.km = km;
                         ri.x = ix;
@@ -627,11 +645,26 @@ std::vector<RoadIntersection> RoadProfileData::FindIntersections(
                         ri.crossingRoad = crossId;
                         ri.isRailway = false;
 
-                        float elev;
-                        if (profileData.SampleElevation(ix, iy, elev))
-                            ri.elevation = elev;
+                        // Our road's elevation at this km
+                        double ourElev = 0;
+                        double bestDist = 1e9;
+                        for (const auto& pt : profilePoints) {
+                            double d = std::abs(pt.km - km);
+                            if (d < bestDist) {
+                                bestDist = d;
+                                ourElev = pt.elevation;
+                            }
+                        }
+                        ri.elevation = ourElev;
+
+                        // Classify crossing type by comparing Z values
+                        double diff = ourElev - foreignZ;
+                        if (std::abs(diff) < 5.0)
+                            ri.crossType = RoadIntersection::CrossType::LevelCrossing;
+                        else if (diff > 0)
+                            ri.crossType = RoadIntersection::CrossType::Overpass;
                         else
-                            ri.elevation = 0;
+                            ri.crossType = RoadIntersection::CrossType::Underpass;
 
                         roadHits[key].push_back(ri);
                     });
@@ -715,8 +748,12 @@ std::vector<RoadIntersection> RoadProfileData::FindIntersections(
                         continue;
                     }
 
+                    const char* medField = feat->GetFieldAsString("medium");
+                    char railMedium = (medField && medField[0]) ? medField[0] : ' ';
+
                     auto processLine = [&](OGRLineString* line) {
-                        testLine(line, [&](double km, double ix, double iy) {
+                        testLine(line, [&](double km, double ix, double iy,
+                                           double /*foreignZ*/) {
                             RoadIntersection ri;
                             ri.km = km;
                             ri.x = ix;
@@ -724,11 +761,40 @@ std::vector<RoadIntersection> RoadProfileData::FindIntersections(
                             ri.railLine = lineName;
                             ri.isRailway = true;
 
-                            float elev;
-                            if (profileData.SampleElevation(ix, iy, elev))
-                                ri.elevation = elev;
-                            else
-                                ri.elevation = 0;
+                            // Our road's elevation at this km
+                            double ourElev = 0;
+                            double bestDist = 1e9;
+                            for (const auto& pt : profilePoints) {
+                                double d = std::abs(pt.km - km);
+                                if (d < bestDist) {
+                                    bestDist = d;
+                                    ourElev = pt.elevation;
+                                }
+                            }
+                            ri.elevation = ourElev;
+
+                            // Classify using railway medium
+                            if (railMedium == 'U' || railMedium == 'T') {
+                                // Railway in tunnel → road is over
+                                ri.crossType = RoadIntersection::CrossType::Overpass;
+                            } else if (railMedium == 'L' || railMedium == 'B') {
+                                // Railway on bridge → road is under
+                                ri.crossType = RoadIntersection::CrossType::Underpass;
+                            } else {
+                                // Both at grade — use DTM for railway elevation
+                                float railElev;
+                                if (profileData.SampleElevation(ix, iy, railElev)) {
+                                    double diff = ourElev - railElev;
+                                    if (std::abs(diff) < 5.0)
+                                        ri.crossType = RoadIntersection::CrossType::LevelCrossing;
+                                    else if (diff > 0)
+                                        ri.crossType = RoadIntersection::CrossType::Overpass;
+                                    else
+                                        ri.crossType = RoadIntersection::CrossType::Underpass;
+                                } else {
+                                    ri.crossType = RoadIntersection::CrossType::LevelCrossing;
+                                }
+                            }
 
                             railHits[lineName].push_back(ri);
                         });
@@ -786,15 +852,24 @@ RoadProfileResult RoadProfileData::BuildRoadProfile(
     const std::string& roadsPath,
     const std::string& railwayPath,
     const RoadId& road,
-    ProfileData& profileData) const
+    ProfileData& profileData,
+    ProgressCb progress) const
 {
+    auto report = [&](int pct, const std::string& msg) {
+        if (progress) progress(pct, msg);
+    };
+
     RoadProfileResult result;
     result.roadId = road;
     result.stats.lineName = road.Label();
 
+    report(0, "Chaining road segments...");
+
     // Chain segments — returns 3D coordinates with embedded elevation
     auto chain3d = ChainSegments(roadsPath, road);
     if (chain3d.size() < 2) return result;
+
+    report(30, "Resampling elevation...");
 
     // Compute cumulative 2D distance along the chain
     auto cumDist = CumulativeDistances(chain3d);
@@ -840,6 +915,8 @@ RoadProfileResult RoadProfileData::BuildRoadProfile(
 
     if (result.points.empty()) return result;
 
+    report(50, "Finding intersections...");
+
     // Extract 2D chain for intersection detection
     std::vector<std::pair<double, double>> chain2d;
     chain2d.reserve(chain3d.size());
@@ -861,6 +938,8 @@ RoadProfileResult RoadProfileData::BuildRoadProfile(
             }
         }
     }
+
+    report(90, "Computing statistics...");
 
     // Compute stats
     auto& st = result.stats;

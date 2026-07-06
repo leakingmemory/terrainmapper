@@ -4,7 +4,9 @@
 #include "RoadProfileData.h"
 
 #include <wx/wx.h>
+#include <wx/listctrl.h>
 #include <wx/scrolwin.h>
+#include <wx/splitter.h>
 
 #include <string>
 #include <vector>
@@ -42,7 +44,9 @@ private:
     wxTextCtrl* m_searchCtrl = nullptr;    // search box for F/K/P categories
     wxChoice* m_lineChoice = nullptr;
     wxButton* m_showBtn = nullptr;
+    wxSplitterWindow* m_splitter = nullptr;
     wxScrolledCanvas* m_canvas = nullptr;
+    wxListCtrl* m_junctionList = nullptr;
     wxPanel* m_statsPanel = nullptr;
 
     // Stats labels
@@ -80,6 +84,7 @@ private:
     void OnMouseMove(wxMouseEvent& event);
     void UpdateStats();
     void PopulateLineChoice();
+    void PopulateJunctionList();
 
     // Current profile points (shared between modes)
     const std::vector<ProfilePoint>& CurrentPoints() const;

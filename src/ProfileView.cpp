@@ -59,16 +59,20 @@ ProfileView::ProfileView(wxWindow* parent,
     topSizer->Add(m_showBtn, 0, wxALIGN_CENTER_VERTICAL | wxRIGHT, 5);
     mainSizer->Add(topSizer, 0, wxEXPAND | wxALL, 5);
 
-    // Center: split between diagram and stats
+    // Center: splitter with diagram on top, junction list on bottom
+    m_splitter = new wxSplitterWindow(this, wxID_ANY,
+        wxDefaultPosition, wxDefaultSize, wxSP_3D | wxSP_LIVE_UPDATE);
+
+    auto* topPanel = new wxPanel(m_splitter);
     auto* centerSizer = new wxBoxSizer(wxHORIZONTAL);
 
-    m_canvas = new wxScrolledCanvas(this, wxID_ANY);
+    m_canvas = new wxScrolledCanvas(topPanel, wxID_ANY);
     m_canvas->SetBackgroundStyle(wxBG_STYLE_PAINT);
     m_canvas->SetBackgroundColour(*wxWHITE);
     centerSizer->Add(m_canvas, 1, wxEXPAND);
 
     // Stats panel
-    m_statsPanel = new wxPanel(this, wxID_ANY);
+    m_statsPanel = new wxPanel(topPanel, wxID_ANY);
     auto* statsSizer = new wxStaticBoxSizer(wxVERTICAL, m_statsPanel, "Key Data");
 
     auto addStat = [&](const wxString& label, wxStaticText** labelOut = nullptr)
@@ -92,7 +96,20 @@ ProfileView::ProfileView(wxWindow* parent,
 
     m_statsPanel->SetSizer(statsSizer);
     centerSizer->Add(m_statsPanel, 0, wxEXPAND | wxLEFT, 5);
-    mainSizer->Add(centerSizer, 1, wxEXPAND | wxALL, 5);
+    topPanel->SetSizer(centerSizer);
+
+    // Bottom panel: junction/intersection list
+    m_junctionList = new wxListCtrl(m_splitter, wxID_ANY,
+        wxDefaultPosition, wxDefaultSize,
+        wxLC_REPORT | wxLC_SINGLE_SEL);
+    m_junctionList->AppendColumn("km", wxLIST_FORMAT_RIGHT, 70);
+    m_junctionList->AppendColumn("Elevation", wxLIST_FORMAT_RIGHT, 70);
+    m_junctionList->AppendColumn("Type", wxLIST_FORMAT_LEFT, 140);
+    m_junctionList->AppendColumn("Description", wxLIST_FORMAT_LEFT, 250);
+
+    m_splitter->SplitHorizontally(topPanel, m_junctionList, -180);
+    m_splitter->SetMinimumPaneSize(80);
+    mainSizer->Add(m_splitter, 1, wxEXPAND | wxALL, 5);
 
     SetSizer(mainSizer);
 
@@ -257,25 +274,10 @@ void ProfileView::OnShowProfile(wxCommandEvent&)
     int sel = m_lineChoice->GetSelection();
     if (sel == wxNOT_FOUND) return;
 
-    wxBeginBusyCursor();
-
+    wxString profileName;
     if (m_mode == Mode::Railway) {
-        if (sel >= static_cast<int>(m_lineNames.size())) {
-            wxEndBusyCursor();
-            return;
-        }
-        const std::string& lineName = m_lineNames[sel];
-        SetStatusText(wxString::Format("Building profile for %s...", lineName), 0);
-
-        m_railResult = m_profileData.BuildProfile(m_railwayPath, lineName);
-
-        if (m_railResult.points.empty()) {
-            wxEndBusyCursor();
-            SetStatusText("No elevation data found.", 0);
-            m_hasProfile = false;
-            m_canvas->Refresh();
-            return;
-        }
+        if (sel >= static_cast<int>(m_lineNames.size())) return;
+        profileName = wxString::FromUTF8(m_lineNames[sel]);
     } else {
         // Rebuild the same filtered list as PopulateLineChoice
         static const char kCats[] = "ERFKP";
@@ -298,26 +300,69 @@ void ProfileView::OnShowProfile(wxCommandEvent&)
             if (filtered.size() >= 200) break;
         }
 
-        if (sel >= static_cast<int>(filtered.size())) {
-            wxEndBusyCursor();
+        if (sel >= static_cast<int>(filtered.size())) return;
+        profileName = wxString::FromUTF8(filtered[sel]->Label());
+    }
+
+    wxProgressDialog progress(
+        "Building Profile",
+        wxString::Format("Preparing %s...", profileName),
+        100, this,
+        wxPD_AUTO_HIDE | wxPD_APP_MODAL | wxPD_SMOOTH |
+        wxPD_ELAPSED_TIME | wxPD_ESTIMATED_TIME);
+
+    auto progressCb = [&](int pct, const std::string& msg) -> bool {
+        progress.Update(pct, wxString::FromUTF8(msg));
+        return true;
+    };
+
+    if (m_mode == Mode::Railway) {
+        const std::string& lineName = m_lineNames[sel];
+        m_railResult = m_profileData.BuildProfile(
+            m_railwayPath, m_roadsPath, lineName, progressCb);
+
+        progress.Update(100);
+        if (m_railResult.points.empty()) {
+            SetStatusText("No elevation data found.", 0);
+            m_hasProfile = false;
+            m_canvas->Refresh();
             return;
         }
+    } else {
+        static const char kCats[] = "ERFKP";
+        int catIdx = m_roadCatChoice->GetSelection();
+        char filterCat = (catIdx >= 0 && catIdx < 5) ? kCats[catIdx] : 'E';
+
+        std::string searchText;
+        if (NeedsSearch(catIdx))
+            searchText = m_searchCtrl->GetValue().ToStdString();
+
+        std::vector<const RoadId*> filtered;
+        for (const auto& r : m_roadList) {
+            if (r.kategori != filterCat) continue;
+            if (!searchText.empty()) {
+                std::string numStr = std::to_string(r.nummer);
+                if (numStr.find(searchText) != 0 && numStr != searchText)
+                    continue;
+            }
+            filtered.push_back(&r);
+            if (filtered.size() >= 200) break;
+        }
+
+        if (sel >= static_cast<int>(filtered.size())) return;
         const auto& road = *filtered[sel];
-        SetStatusText(wxString::Format("Building profile for %s...", road.Label()), 0);
 
         m_roadResult = m_roadProfileData.BuildRoadProfile(
-            m_roadsPath, m_railwayPath, road, m_profileData);
+            m_roadsPath, m_railwayPath, road, m_profileData, progressCb);
 
+        progress.Update(100);
         if (m_roadResult.points.empty()) {
-            wxEndBusyCursor();
             SetStatusText("No elevation data found.", 0);
             m_hasProfile = false;
             m_canvas->Refresh();
             return;
         }
     }
-
-    wxEndBusyCursor();
 
     m_hasProfile = true;
     const auto& pts = CurrentPoints();
@@ -350,6 +395,7 @@ void ProfileView::OnShowProfile(wxCommandEvent&)
                             0, 0);
 
     UpdateStats();
+    PopulateJunctionList();
     m_canvas->Refresh();
 
     const auto& stats = (m_mode == Mode::Railway) ?
@@ -561,6 +607,76 @@ void ProfileView::OnPaint(wxPaintEvent&)
                                    45.0);
             }
         }
+
+        // Junction markers on railway profile
+        for (const auto& jn : m_railResult.junctions) {
+            int x = KmToX(jn.km);
+            if (jn.elevation < -9000) continue;
+            int y = ElevToY(jn.elevation);
+
+            using JT = TrackJunction::Type;
+            switch (jn.type) {
+                case JT::Switch:
+                case JT::DoubleSwitch: {
+                    // Turnout: filled triangle pointing up
+                    dc.SetPen(wxPen(*wxBLACK, 1));
+                    dc.SetBrush(wxBrush(wxColour(255, 200, 0)));
+                    wxPoint tri[3] = {{x, y - 5}, {x + 4, y + 3}, {x - 4, y + 3}};
+                    dc.DrawPolygon(3, tri);
+                    break;
+                }
+                case JT::DiamondCrossing: {
+                    // Diamond in yellow
+                    dc.SetPen(wxPen(*wxBLACK, 1));
+                    dc.SetBrush(wxBrush(wxColour(255, 220, 50)));
+                    wxPoint dm[4] = {{x, y - 5}, {x + 4, y}, {x, y + 5}, {x - 4, y}};
+                    dc.DrawPolygon(4, dm);
+                    break;
+                }
+                case JT::Overpass: {
+                    // Arch symbol in blue
+                    dc.SetPen(wxPen(wxColour(70, 130, 180), 2));
+                    dc.DrawArc(x - 5, y, x + 5, y, x, y - 5);
+                    break;
+                }
+                case JT::Underpass: {
+                    // U shape in brown
+                    dc.SetPen(wxPen(wxColour(120, 100, 80), 2));
+                    dc.DrawArc(x + 5, y, x - 5, y, x, y + 5);
+                    break;
+                }
+                case JT::RoadLevelCrossing: {
+                    // X mark in dark red
+                    dc.SetPen(wxPen(wxColour(160, 20, 20), 2));
+                    dc.DrawLine(x - 4, y - 4, x + 4, y + 4);
+                    dc.DrawLine(x - 4, y + 4, x + 4, y - 4);
+                    break;
+                }
+                case JT::RoadOverpass: {
+                    // Road over: filled arch in grey
+                    dc.SetPen(wxPen(wxColour(100, 100, 100), 2));
+                    dc.DrawArc(x - 5, y, x + 5, y, x, y - 5);
+                    break;
+                }
+                case JT::RoadUnderpass: {
+                    // Road under: U in grey
+                    dc.SetPen(wxPen(wxColour(100, 100, 100), 2));
+                    dc.DrawArc(x + 5, y, x - 5, y, x, y + 5);
+                    break;
+                }
+            }
+
+            // Label for junctions with other lines or roads
+            if (!jn.description.empty()) {
+                dc.SetTextForeground(wxColour(80, 80, 80));
+                dc.SetFont(wxFont(6, wxFONTFAMILY_SWISS, wxFONTSTYLE_NORMAL,
+                                   wxFONTWEIGHT_NORMAL));
+                dc.DrawRotatedText(wxString::FromUTF8(jn.description),
+                                   x + 3, y - 8, 45.0);
+                dc.SetFont(wxFont(7, wxFONTFAMILY_SWISS, wxFONTSTYLE_NORMAL,
+                                   wxFONTWEIGHT_NORMAL));
+            }
+        }
     } else {
         // Road intersection markers
         for (const auto& ix : m_roadResult.intersections) {
@@ -592,6 +708,22 @@ void ProfileView::OnPaint(wxPaintEvent&)
                 wxPoint diamond[4] = {{x, y - 4}, {x + 4, y},
                                       {x, y + 4}, {x - 4, y}};
                 dc.DrawPolygon(4, diamond);
+            }
+
+            // Crossing type indicator
+            using CT = RoadIntersection::CrossType;
+            if (ix.crossType == CT::Overpass) {
+                // Small up arrow
+                dc.SetPen(wxPen(wxColour(0, 100, 200), 1));
+                dc.DrawLine(x, y - 8, x, y - 12);
+                dc.DrawLine(x - 2, y - 10, x, y - 12);
+                dc.DrawLine(x + 2, y - 10, x, y - 12);
+            } else if (ix.crossType == CT::Underpass) {
+                // Small down arrow
+                dc.SetPen(wxPen(wxColour(0, 100, 200), 1));
+                dc.DrawLine(x, y + 8, x, y + 12);
+                dc.DrawLine(x - 2, y + 10, x, y + 12);
+                dc.DrawLine(x + 2, y + 10, x, y + 12);
             }
 
             // Label
@@ -730,4 +862,74 @@ void ProfileView::UpdateStats()
 
     m_lblSegments->SetLabel(wxString::Format("%d", s.segmentCount));
     m_statsPanel->Layout();
+}
+
+namespace {
+const char* JunctionTypeName(TrackJunction::Type t)
+{
+    switch (t) {
+        case TrackJunction::Type::Switch:           return "Switch";
+        case TrackJunction::Type::DoubleSwitch:     return "Double switch";
+        case TrackJunction::Type::DiamondCrossing:  return "Diamond crossing";
+        case TrackJunction::Type::Overpass:         return "Track overpass";
+        case TrackJunction::Type::Underpass:        return "Track underpass";
+        case TrackJunction::Type::RoadLevelCrossing: return "Road level crossing";
+        case TrackJunction::Type::RoadOverpass:     return "Road overpass";
+        case TrackJunction::Type::RoadUnderpass:    return "Road underpass";
+        default: return "Unknown";
+    }
+}
+
+const char* RoadCrossTypeName(RoadIntersection::CrossType t)
+{
+    switch (t) {
+        case RoadIntersection::CrossType::LevelCrossing: return "Level crossing";
+        case RoadIntersection::CrossType::Overpass:      return "Overpass";
+        case RoadIntersection::CrossType::Underpass:     return "Underpass";
+        default: return "";
+    }
+}
+} // anon
+
+void ProfileView::PopulateJunctionList()
+{
+    m_junctionList->DeleteAllItems();
+
+    if (m_mode == Mode::Railway) {
+        for (const auto& jn : m_railResult.junctions) {
+            long idx = m_junctionList->InsertItem(
+                m_junctionList->GetItemCount(),
+                wxString::Format("%.1f", jn.km));
+            m_junctionList->SetItem(idx, 1,
+                wxString::Format("%.0f m", jn.elevation));
+            wxString typeStr = JunctionTypeName(jn.type);
+            if (jn.numSwitches > 0)
+                typeStr += wxString::Format(" (%d)", jn.numSwitches);
+            m_junctionList->SetItem(idx, 2, typeStr);
+            m_junctionList->SetItem(idx, 3,
+                wxString::FromUTF8(jn.description));
+        }
+    } else {
+        for (const auto& ix : m_roadResult.intersections) {
+            long idx = m_junctionList->InsertItem(
+                m_junctionList->GetItemCount(),
+                wxString::Format("%.1f", ix.km));
+            m_junctionList->SetItem(idx, 1,
+                wxString::Format("%.0f m", ix.elevation));
+
+            wxString typeStr;
+            if (ix.isRailway)
+                typeStr = "Railway";
+            else
+                typeStr = "Road";
+            wxString crossStr = RoadCrossTypeName(ix.crossType);
+            if (!crossStr.empty())
+                typeStr += wxString(" — ") + crossStr;
+            m_junctionList->SetItem(idx, 2, typeStr);
+
+            std::string name = ix.isRailway ? ix.railLine
+                                             : ix.crossingRoad.Label();
+            m_junctionList->SetItem(idx, 3, wxString::FromUTF8(name));
+        }
+    }
 }

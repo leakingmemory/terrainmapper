@@ -17,11 +17,18 @@ struct RoadId {
 
 struct RoadIntersection {
     double km;            // distance along the profiled road
-    double elevation;     // from DTM
+    double elevation;     // road surface elevation
     double x, y;          // EPSG:25833 coordinate
     RoadId crossingRoad;  // if road-road intersection
     std::string railLine; // if road-rail intersection
     bool isRailway;       // true = rail, false = road
+    enum class CrossType {
+        LevelCrossing,    // same grade
+        Overpass,         // profiled road goes over
+        Underpass,        // profiled road goes under
+        Unknown
+    };
+    CrossType crossType = CrossType::Unknown;
 };
 
 struct RoadProfileResult {
@@ -36,12 +43,16 @@ public:
     // Get list of distinct roads from the GPKG, sorted by category then number
     std::vector<RoadId> GetRoadList(const std::string& roadsPath) const;
 
+    // Progress callback: (percentage 0-100, stage description) → continue?
+    using ProgressCb = std::function<bool(int pct, const std::string& msg)>;
+
     // Build a profile for the given road
     RoadProfileResult BuildRoadProfile(
         const std::string& roadsPath,
         const std::string& railwayPath,
         const RoadId& road,
-        ProfileData& profileData) const;
+        ProfileData& profileData,
+        ProgressCb progress = nullptr) const;
 
 private:
     // Chain road segments into a continuous polyline
