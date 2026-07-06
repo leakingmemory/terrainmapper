@@ -6,6 +6,7 @@
 #include <algorithm>
 #include <cmath>
 #include <map>
+#include <queue>
 #include <set>
 #include <unordered_map>
 
@@ -87,59 +88,27 @@ std::vector<RoadId> RoadProfileData::GetRoadList(const std::string& roadsPath) c
 
 namespace {
 
-// Spatial hash for endpoint matching
-struct EndpointHash {
-    static constexpr double kCellSize = 5.0;
-
-    struct Entry {
-        int segIdx;
-        bool isEnd;  // false = start of segment, true = end
-        double x, y;
-    };
-
-    std::unordered_map<int64_t, std::vector<Entry>> grid;
-
-    static int64_t key(double x, double y) {
-        int gx = static_cast<int>(std::floor(x / kCellSize));
-        int gy = static_cast<int>(std::floor(y / kCellSize));
-        return static_cast<int64_t>(gx) * 1000003LL + gy;
-    }
-
-    void insert(int segIdx, bool isEnd, double x, double y) {
-        grid[key(x, y)].push_back({segIdx, isEnd, x, y});
-    }
-
-    // Find segments whose endpoints are within tolerance of (x,y)
-    std::vector<Entry> query(double x, double y, double tol) const {
-        std::vector<Entry> result;
-        int r = static_cast<int>(std::ceil(tol / kCellSize));
-        int cx = static_cast<int>(std::floor(x / kCellSize));
-        int cy = static_cast<int>(std::floor(y / kCellSize));
-        double tol2 = tol * tol;
-
-        for (int dx = -r; dx <= r; dx++) {
-            for (int dy = -r; dy <= r; dy++) {
-                int64_t k = static_cast<int64_t>(cx + dx) * 1000003LL + (cy + dy);
-                auto it = grid.find(k);
-                if (it == grid.end()) continue;
-                for (const auto& e : it->second) {
-                    double ddx = e.x - x, ddy = e.y - y;
-                    if (ddx * ddx + ddy * ddy <= tol2)
-                        result.push_back(e);
-                }
-            }
-        }
-        return result;
-    }
-};
+using Coord3D = std::tuple<double, double, double>;
 
 struct RawSeg {
-    std::vector<std::pair<double, double>> coords;
+    std::vector<Coord3D> coords;
+    double length = 0;
 };
+
+// Compute 2D length of a segment (horizontal distance only)
+double SegLength(const std::vector<Coord3D>& c) {
+    double len = 0;
+    for (size_t i = 1; i < c.size(); i++) {
+        double dx = std::get<0>(c[i]) - std::get<0>(c[i-1]);
+        double dy = std::get<1>(c[i]) - std::get<1>(c[i-1]);
+        len += std::sqrt(dx * dx + dy * dy);
+    }
+    return len;
+}
 
 } // anon namespace
 
-std::vector<std::pair<double, double>> RoadProfileData::ChainSegments(
+std::vector<Coord3D> RoadProfileData::ChainSegments(
     const std::string& roadsPath,
     const RoadId& road) const
 {
@@ -185,12 +154,15 @@ std::vector<std::pair<double, double>> RoadProfileData::ChainSegments(
         int nPts = line->getNumPoints();
         for (int p = 0; p < nPts; p++) {
             double x = line->getX(p), y = line->getY(p);
+            double z = line->getZ(p);
             if (toUniform)
                 toUniform->Transform(1, &x, &y);
-            seg.coords.push_back({x, y});
+            seg.coords.push_back({x, y, z});
         }
-        if (seg.coords.size() >= 2)
+        if (seg.coords.size() >= 2) {
+            seg.length = SegLength(seg.coords);
             segments.push_back(std::move(seg));
+        }
 
         OGRFeature::DestroyFeature(feat);
     }
@@ -201,127 +173,227 @@ std::vector<std::pair<double, double>> RoadProfileData::ChainSegments(
     if (segments.empty()) return {};
     if (segments.size() == 1) return segments[0].coords;
 
-    // Build endpoint spatial hash
-    constexpr double kMatchTol = 2.0;  // metres
-    EndpointHash epHash;
+    // ── Build a graph over segment endpoints ──
+    // Nodes are unique positions (endpoints snapped within tolerance).
+    // Edges are segments connecting two nodes.
+    constexpr double kMatchTol = 10.0;  // metres
+    constexpr double kSnapGrid = 1.0;   // 1m grid for node identification
 
-    for (int i = 0; i < static_cast<int>(segments.size()); i++) {
-        const auto& s = segments[i];
-        epHash.insert(i, false, s.coords.front().first, s.coords.front().second);
-        epHash.insert(i, true, s.coords.back().first, s.coords.back().second);
-    }
+    // Snap a coordinate to a grid cell key
+    auto snapKey = [](double x, double y) -> int64_t {
+        int gx = static_cast<int>(std::round(x));
+        int gy = static_cast<int>(std::round(y));
+        return static_cast<int64_t>(gx) * 10000007LL + gy;
+    };
 
-    // Find a starting segment: one whose start has degree 1 (dead end)
-    int startSeg = 0;
+    // Assign each endpoint to a node ID.  Use a spatial approach:
+    // collect all endpoints, sort, and merge nearby ones.
+    struct EndPt {
+        double x, y;
+        int segIdx;
+        bool isEnd;
+    };
+    std::vector<EndPt> allEndpoints;
+    allEndpoints.reserve(segments.size() * 2);
     for (int i = 0; i < static_cast<int>(segments.size()); i++) {
         auto& s = segments[i];
-        auto neighbors = epHash.query(s.coords.front().first,
-                                      s.coords.front().second, kMatchTol);
-        // Count distinct segments at this endpoint (exclude self)
-        int degree = 0;
-        for (const auto& n : neighbors)
-            if (n.segIdx != i) degree++;
-        if (degree == 0) {
-            startSeg = i;
-            break;
+        allEndpoints.push_back({std::get<0>(s.coords.front()), std::get<1>(s.coords.front()), i, false});
+        allEndpoints.push_back({std::get<0>(s.coords.back()), std::get<1>(s.coords.back()), i, true});
+    }
+
+    // Assign node IDs: endpoints within kMatchTol get the same node.
+    // Use a grid-cell approach with multi-cell lookup.
+    int nextNodeId = 0;
+    std::vector<int> epNodeId(allEndpoints.size(), -1);
+
+    // Grid: cell → list of (endpoint index, node ID, x, y)
+    struct GridEntry { int epIdx; int nodeId; double x, y; };
+    std::unordered_map<int64_t, std::vector<GridEntry>> nodeGrid;
+    constexpr double kNodeCell = 10.0;
+
+    auto nodeGridKey = [&](double x, double y) -> int64_t {
+        int gx = static_cast<int>(std::floor(x / kNodeCell));
+        int gy = static_cast<int>(std::floor(y / kNodeCell));
+        return static_cast<int64_t>(gx) * 10000007LL + gy;
+    };
+
+    auto findNearNode = [&](double x, double y) -> int {
+        int cx = static_cast<int>(std::floor(x / kNodeCell));
+        int cy = static_cast<int>(std::floor(y / kNodeCell));
+        double bestD2 = kMatchTol * kMatchTol;
+        int bestNode = -1;
+        for (int dx = -1; dx <= 1; dx++) {
+            for (int dy = -1; dy <= 1; dy++) {
+                int64_t k = static_cast<int64_t>(cx + dx) * 10000007LL + (cy + dy);
+                auto it = nodeGrid.find(k);
+                if (it == nodeGrid.end()) continue;
+                for (auto& ge : it->second) {
+                    double ddx = ge.x - x, ddy = ge.y - y;
+                    double d2 = ddx * ddx + ddy * ddy;
+                    if (d2 < bestD2) {
+                        bestD2 = d2;
+                        bestNode = ge.nodeId;
+                    }
+                }
+            }
+        }
+        return bestNode;
+    };
+
+    for (int i = 0; i < static_cast<int>(allEndpoints.size()); i++) {
+        auto& ep = allEndpoints[i];
+        int existing = findNearNode(ep.x, ep.y);
+        if (existing >= 0) {
+            epNodeId[i] = existing;
+        } else {
+            int nid = nextNodeId++;
+            epNodeId[i] = nid;
+            int64_t k = nodeGridKey(ep.x, ep.y);
+            nodeGrid[k].push_back({i, nid, ep.x, ep.y});
         }
     }
 
-    // Greedy chain traversal
-    std::vector<bool> visited(segments.size(), false);
-    std::vector<std::pair<double, double>> chain;
+    int numNodes = nextNodeId;
 
-    int cur = startSeg;
-    bool curReversed = false;
+    // Map segment → (startNode, endNode)
+    struct SegEdge { int segIdx; int nodeA, nodeB; };
+    std::vector<SegEdge> edges(segments.size());
+    for (int i = 0; i < static_cast<int>(segments.size()); i++) {
+        edges[i] = {i, epNodeId[2 * i], epNodeId[2 * i + 1]};
+    }
 
-    while (cur >= 0) {
-        visited[cur] = true;
-        auto& seg = segments[cur];
+    // Adjacency list: node → [(neighborNode, segIdx)]
+    std::vector<std::vector<std::pair<int, int>>> adj(numNodes);
+    for (int i = 0; i < static_cast<int>(segments.size()); i++) {
+        int a = edges[i].nodeA, b = edges[i].nodeB;
+        if (a == b) continue;  // degenerate
+        adj[a].push_back({b, i});
+        adj[b].push_back({a, i});
+    }
 
-        // Append coordinates (possibly reversed)
-        if (curReversed) {
+    // ── Find the diameter of the largest connected component ──
+    // BFS from node 0 of the largest component → farthest node A
+    // BFS from A → farthest node B, using weighted distance (segment length)
+    // The path A→B is the main road spine.
+
+    // Weighted BFS (Dijkstra) to find farthest node, returning parent edges
+    auto dijkstra = [&](int start) -> std::pair<int, std::vector<int>> {
+        // Returns (farthest node, parent-edge-index for each node)
+        std::vector<double> dist(numNodes, -1);
+        std::vector<int> parentEdge(numNodes, -1);
+        // Simple priority queue: (distance, node)
+        using PQE = std::pair<double, int>;
+        std::priority_queue<PQE, std::vector<PQE>, std::greater<PQE>> pq;
+        dist[start] = 0;
+        pq.push({0, start});
+
+        int farthest = start;
+        double maxDist = 0;
+
+        while (!pq.empty()) {
+            auto [d, u] = pq.top(); pq.pop();
+            if (d > dist[u]) continue;
+
+            if (d > maxDist) {
+                maxDist = d;
+                farthest = u;
+            }
+
+            for (auto [v, segIdx] : adj[u]) {
+                double nd = d + segments[segIdx].length;
+                if (dist[v] < 0 || nd < dist[v]) {
+                    dist[v] = nd;
+                    parentEdge[v] = segIdx;
+                    pq.push({nd, v});
+                }
+            }
+        }
+
+        return {farthest, std::move(parentEdge)};
+    };
+
+    // Find largest connected component by total segment length
+    std::vector<bool> visited(numNodes, false);
+    int bestCompStart = 0;
+    double bestCompLen = 0;
+
+    for (int n = 0; n < numNodes; n++) {
+        if (visited[n]) continue;
+        // BFS to find component size
+        std::vector<int> comp;
+        std::queue<int> q;
+        q.push(n);
+        visited[n] = true;
+        double compLen = 0;
+        while (!q.empty()) {
+            int u = q.front(); q.pop();
+            comp.push_back(u);
+            for (auto [v, segIdx] : adj[u]) {
+                compLen += segments[segIdx].length * 0.5; // each edge counted twice
+                if (!visited[v]) {
+                    visited[v] = true;
+                    q.push(v);
+                }
+            }
+        }
+        if (compLen > bestCompLen) {
+            bestCompLen = compLen;
+            bestCompStart = n;
+        }
+    }
+
+    // Double Dijkstra to find diameter path
+    auto [nodeA, parentA] = dijkstra(bestCompStart);
+    auto [nodeB, parentB] = dijkstra(nodeA);
+
+    // Reconstruct path from nodeA to nodeB using parentB edges
+    std::vector<int> pathSegments;  // segment indices in order
+    std::vector<bool> pathDirection; // true = traverse segment reversed (B→A)
+    {
+        int cur = nodeB;
+        while (parentB[cur] >= 0) {
+            int segIdx = parentB[cur];
+            pathSegments.push_back(segIdx);
+            // Determine direction: the segment goes from nodeA to nodeB
+            // If edges[segIdx].nodeB == cur, traversal is A→B (normal)
+            // If edges[segIdx].nodeA == cur, traversal is B→A (reversed)
+            bool rev = (edges[segIdx].nodeA == cur);
+            pathDirection.push_back(rev);
+            cur = rev ? edges[segIdx].nodeB : edges[segIdx].nodeA;
+        }
+        // Path is built backwards (from B to A), reverse it
+        std::reverse(pathSegments.begin(), pathSegments.end());
+        std::reverse(pathDirection.begin(), pathDirection.end());
+    }
+
+    // ── Collect coordinates along the path ──
+    constexpr double kDupTol2 = kMatchTol * kMatchTol;
+    std::vector<Coord3D> chain;
+    chain.reserve(pathSegments.size() * 10);
+
+    for (size_t pi = 0; pi < pathSegments.size(); pi++) {
+        auto& seg = segments[pathSegments[pi]];
+        bool rev = pathDirection[pi];
+
+        if (rev) {
             for (int i = static_cast<int>(seg.coords.size()) - 1; i >= 0; i--) {
-                if (!chain.empty()) {
-                    // Skip first point if it matches chain end (avoid duplicate)
-                    auto& last = chain.back();
-                    double dx = seg.coords[i].first - last.first;
-                    double dy = seg.coords[i].second - last.second;
-                    if (dx * dx + dy * dy < kMatchTol * kMatchTol && i > 0)
-                        continue;
+                if (!chain.empty() && i == static_cast<int>(seg.coords.size()) - 1) {
+                    double dx = std::get<0>(seg.coords[i]) - std::get<0>(chain.back());
+                    double dy = std::get<1>(seg.coords[i]) - std::get<1>(chain.back());
+                    if (dx * dx + dy * dy < kDupTol2) continue;
                 }
                 chain.push_back(seg.coords[i]);
             }
         } else {
             for (size_t i = 0; i < seg.coords.size(); i++) {
                 if (!chain.empty() && i == 0) {
-                    auto& last = chain.back();
-                    double dx = seg.coords[i].first - last.first;
-                    double dy = seg.coords[i].second - last.second;
-                    if (dx * dx + dy * dy < kMatchTol * kMatchTol)
-                        continue;
+                    double dx = std::get<0>(seg.coords[i]) - std::get<0>(chain.back());
+                    double dy = std::get<1>(seg.coords[i]) - std::get<1>(chain.back());
+                    if (dx * dx + dy * dy < kDupTol2) continue;
                 }
                 chain.push_back(seg.coords[i]);
             }
         }
-
-        // Find next unvisited segment connecting at the chain end
-        auto& endPt = chain.back();
-        auto neighbors = epHash.query(endPt.first, endPt.second, kMatchTol);
-
-        int nextSeg = -1;
-        bool nextReversed = false;
-        double bestAngle = 999;
-
-        // Direction of chain end (last two points)
-        double chainDx = 0, chainDy = 0;
-        if (chain.size() >= 2) {
-            auto& p1 = chain[chain.size() - 2];
-            auto& p2 = chain[chain.size() - 1];
-            chainDx = p2.first - p1.first;
-            chainDy = p2.second - p1.second;
-            double len = std::sqrt(chainDx * chainDx + chainDy * chainDy);
-            if (len > 0) { chainDx /= len; chainDy /= len; }
-        }
-
-        for (const auto& n : neighbors) {
-            if (n.segIdx == cur || visited[n.segIdx]) continue;
-
-            // If the neighbor's start matched our end, append it normally.
-            // If its end matched, we need to reverse it.
-            bool rev = n.isEnd;  // if we matched its end, reverse
-
-            // Check direction continuity
-            auto& ns = segments[n.segIdx];
-            double nx, ny;
-            if (rev) {
-                // Going from end to start
-                auto& p1 = ns.coords.back();
-                auto& p2 = (ns.coords.size() >= 2) ?
-                    ns.coords[ns.coords.size() - 2] : ns.coords[0];
-                nx = p2.first - p1.first;
-                ny = p2.second - p1.second;
-            } else {
-                auto& p1 = ns.coords[0];
-                auto& p2 = (ns.coords.size() >= 2) ? ns.coords[1] : ns.coords[0];
-                nx = p2.first - p1.first;
-                ny = p2.second - p1.second;
-            }
-            double nlen = std::sqrt(nx * nx + ny * ny);
-            if (nlen > 0) { nx /= nlen; ny /= nlen; }
-
-            // Angle between chain direction and candidate
-            double dot = chainDx * nx + chainDy * ny;
-            double angle = std::acos(std::clamp(dot, -1.0, 1.0));
-
-            if (nextSeg < 0 || angle < bestAngle) {
-                nextSeg = n.segIdx;
-                nextReversed = rev;
-                bestAngle = angle;
-            }
-        }
-
-        cur = nextSeg;
-        curReversed = nextReversed;
     }
 
     return chain;
@@ -349,7 +421,7 @@ bool SegmentIntersect(double a1x, double a1y, double a2x, double a2y,
     return tA >= 0 && tA <= 1 && tB >= 0 && tB <= 1;
 }
 
-// Compute cumulative distances along a polyline
+// Compute cumulative 2D distances along a polyline
 std::vector<double> CumulativeDistances(
     const std::vector<std::pair<double, double>>& coords)
 {
@@ -357,6 +429,19 @@ std::vector<double> CumulativeDistances(
     for (size_t i = 1; i < coords.size(); i++) {
         double dx = coords[i].first - coords[i - 1].first;
         double dy = coords[i].second - coords[i - 1].second;
+        dist[i] = dist[i - 1] + std::sqrt(dx * dx + dy * dy);
+    }
+    return dist;
+}
+
+// Overload for 3D coordinates (uses 2D horizontal distance)
+std::vector<double> CumulativeDistances(
+    const std::vector<Coord3D>& coords)
+{
+    std::vector<double> dist(coords.size(), 0.0);
+    for (size_t i = 1; i < coords.size(); i++) {
+        double dx = std::get<0>(coords[i]) - std::get<0>(coords[i - 1]);
+        double dy = std::get<1>(coords[i]) - std::get<1>(coords[i - 1]);
         dist[i] = dist[i - 1] + std::sqrt(dx * dx + dy * dy);
     }
     return dist;
@@ -707,78 +792,65 @@ RoadProfileResult RoadProfileData::BuildRoadProfile(
     result.roadId = road;
     result.stats.lineName = road.Label();
 
-    // Chain segments
-    auto chain = ChainSegments(roadsPath, road);
-    if (chain.size() < 2) return result;
+    // Chain segments — returns 3D coordinates with embedded elevation
+    auto chain3d = ChainSegments(roadsPath, road);
+    if (chain3d.size() < 2) return result;
 
-    // Densify and sample elevation
-    auto params = GetSmoothParams(road.kategori);
-
-    // Compute cumulative distance along the chain
-    auto cumDist = CumulativeDistances(chain);
+    // Compute cumulative 2D distance along the chain
+    auto cumDist = CumulativeDistances(chain3d);
     double totalLen = cumDist.back();
     if (totalLen < 1.0) return result;
 
-    // Interpolate along the chain at sample spacing
+    // Resample at regular spacing for a clean profile
+    auto params = GetSmoothParams(road.kategori);
     int nSamples = std::max(2, static_cast<int>(totalLen / params.sampleSpacing) + 1);
 
-    auto interpolatePoint = [&](double targetDist) -> std::pair<double, double> {
-        // Binary search for the segment containing targetDist
+    auto interpolatePoint = [&](double targetDist) -> std::tuple<double, double, double> {
         auto it = std::upper_bound(cumDist.begin(), cumDist.end(), targetDist);
         size_t idx = (it == cumDist.begin()) ? 0 :
                      static_cast<size_t>(it - cumDist.begin() - 1);
-        if (idx >= chain.size() - 1) idx = chain.size() - 2;
+        if (idx >= chain3d.size() - 1) idx = chain3d.size() - 2;
 
         double segLen = cumDist[idx + 1] - cumDist[idx];
         double f = (segLen > 0) ? (targetDist - cumDist[idx]) / segLen : 0;
         f = std::clamp(f, 0.0, 1.0);
 
-        return {chain[idx].first + f * (chain[idx + 1].first - chain[idx].first),
-                chain[idx].second + f * (chain[idx + 1].second - chain[idx].second)};
+        auto& [x0, y0, z0] = chain3d[idx];
+        auto& [x1, y1, z1] = chain3d[idx + 1];
+        return {x0 + f * (x1 - x0),
+                y0 + f * (y1 - y0),
+                z0 + f * (z1 - z0)};
     };
 
     for (int s = 0; s < nSamples; s++) {
         double frac = static_cast<double>(s) / (nSamples - 1);
         double dist = frac * totalLen;
-        auto [x, y] = interpolatePoint(dist);
+        auto [x, y, z] = interpolatePoint(dist);
 
         ProfilePoint pt;
         pt.km = dist / 1000.0;
         pt.x = x;
         pt.y = y;
+        pt.elevation = z;
         pt.medium = ' ';
         pt.interpolated = false;
-
-        float elev;
-        if (profileData.SampleElevation(x, y, elev))
-            pt.elevation = elev;
-        else
-            pt.elevation = -9999;
 
         result.points.push_back(pt);
     }
 
-    // Remove failed elevation samples
-    result.points.erase(
-        std::remove_if(result.points.begin(), result.points.end(),
-                        [](const ProfilePoint& p) {
-                            return p.elevation < -9000;
-                        }),
-        result.points.end());
-
     if (result.points.empty()) return result;
 
-    // Smooth with road-appropriate parameters
-    ProfileData::SmoothWithParams(result.points,
-                                  params.elevSigmaKm,
-                                  params.maxGrade,
-                                  params.gradeSigmaKm);
+    // Extract 2D chain for intersection detection
+    std::vector<std::pair<double, double>> chain2d;
+    chain2d.reserve(chain3d.size());
+    for (auto& [x, y, z] : chain3d)
+        chain2d.push_back({x, y});
 
     // Find intersections
     result.intersections = FindIntersections(
-        roadsPath, railwayPath, road, chain, result.points, profileData);
+        roadsPath, railwayPath, road, chain2d, result.points, profileData);
 
-    // Update intersection elevations from smoothed profile
+    // Update intersection elevations from profile
     for (auto& ix : result.intersections) {
         double bestDist = 1e9;
         for (const auto& pt : result.points) {
@@ -801,16 +873,15 @@ RoadProfileResult RoadProfileData::BuildRoadProfile(
     st.maxGradePct = 0;
     st.tunnelLengthKm = 0;
     st.bridgeLengthKm = 0;
-    st.segmentCount = static_cast<int>(chain.size());
+    st.segmentCount = static_cast<int>(chain3d.size());
     st.stationCount = static_cast<int>(result.intersections.size());
 
     for (size_t i = 0; i < result.points.size(); i++) {
         double e = result.points[i].elevation;
-        if (e < -9000) continue;
         st.minElev = std::min(st.minElev, e);
         st.maxElev = std::max(st.maxElev, e);
 
-        if (i > 0 && result.points[i - 1].elevation > -9000) {
+        if (i > 0) {
             double de = e - result.points[i - 1].elevation;
             double dk = (result.points[i].km - result.points[i - 1].km) * 1000.0;
             if (de > 0) st.totalClimb += de;

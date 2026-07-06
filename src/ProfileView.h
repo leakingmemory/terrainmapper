@@ -38,6 +38,8 @@ private:
 
     // UI elements
     wxChoice* m_modeChoice = nullptr;
+    wxChoice* m_roadCatChoice = nullptr;   // road category filter (E/R/F/K/P)
+    wxTextCtrl* m_searchCtrl = nullptr;    // search box for F/K/P categories
     wxChoice* m_lineChoice = nullptr;
     wxButton* m_showBtn = nullptr;
     wxScrolledCanvas* m_canvas = nullptr;
@@ -71,6 +73,8 @@ private:
     double m_mouseElev = -1;
 
     void OnModeChanged(wxCommandEvent& event);
+    void OnRoadCatChanged(wxCommandEvent& event);
+    void OnSearchText(wxCommandEvent& event);
     void OnShowProfile(wxCommandEvent& event);
     void OnPaint(wxPaintEvent& event);
     void OnMouseMove(wxMouseEvent& event);

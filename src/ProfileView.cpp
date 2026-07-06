@@ -32,8 +32,25 @@ ProfileView::ProfileView(wxWindow* parent,
         m_modeChoice->SetSelection(0);
     topSizer->Add(m_modeChoice, 0, wxALIGN_CENTER_VERTICAL | wxRIGHT, 10);
 
-    topSizer->Add(new wxStaticText(this, wxID_ANY, "Select:"),
-                  0, wxALIGN_CENTER_VERTICAL | wxRIGHT, 5);
+    // Road category filter (hidden when in railway mode)
+    m_roadCatChoice = new wxChoice(this, wxID_ANY);
+    m_roadCatChoice->Append("E — European");
+    m_roadCatChoice->Append("R — National");
+    m_roadCatChoice->Append("F — County");
+    m_roadCatChoice->Append("K — Municipal");
+    m_roadCatChoice->Append("P — Private");
+    m_roadCatChoice->SetSelection(0);
+    m_roadCatChoice->Hide();
+    topSizer->Add(m_roadCatChoice, 0, wxALIGN_CENTER_VERTICAL | wxRIGHT, 5);
+
+    // Search box for F/K/P categories (type road number to filter)
+    m_searchCtrl = new wxTextCtrl(this, wxID_ANY, wxEmptyString,
+                                  wxDefaultPosition, wxSize(80, -1),
+                                  wxTE_PROCESS_ENTER);
+    m_searchCtrl->SetHint("Number...");
+    m_searchCtrl->Hide();
+    topSizer->Add(m_searchCtrl, 0, wxALIGN_CENTER_VERTICAL | wxRIGHT, 5);
+
     m_lineChoice = new wxChoice(this, wxID_ANY);
     topSizer->Add(m_lineChoice, 1, wxALIGN_CENTER_VERTICAL | wxRIGHT, 5);
 
@@ -84,6 +101,9 @@ ProfileView::ProfileView(wxWindow* parent,
 
     // Event bindings
     m_modeChoice->Bind(wxEVT_CHOICE, &ProfileView::OnModeChanged, this);
+    m_roadCatChoice->Bind(wxEVT_CHOICE, &ProfileView::OnRoadCatChanged, this);
+    m_searchCtrl->Bind(wxEVT_TEXT, &ProfileView::OnSearchText, this);
+    m_searchCtrl->Bind(wxEVT_TEXT_ENTER, &ProfileView::OnSearchText, this);
     m_showBtn->Bind(wxEVT_BUTTON, &ProfileView::OnShowProfile, this);
     m_canvas->Bind(wxEVT_PAINT, &ProfileView::OnPaint, this);
     m_canvas->Bind(wxEVT_MOTION, &ProfileView::OnMouseMove, this);
@@ -127,6 +147,12 @@ ProfileView::ProfileView(wxWindow* parent,
                                    tilesIndexed), 0);
 }
 
+static bool NeedsSearch(int catIdx)
+{
+    // F(2), K(3), P(4) have too many roads for a dropdown
+    return catIdx >= 2;
+}
+
 void ProfileView::OnModeChanged(wxCommandEvent&)
 {
     wxString sel = m_modeChoice->GetStringSelection();
@@ -135,9 +161,29 @@ void ProfileView::OnModeChanged(wxCommandEvent&)
     else
         m_mode = Mode::Road;
 
+    bool isRoad = (m_mode == Mode::Road);
+    m_roadCatChoice->Show(isRoad);
+    m_searchCtrl->Show(isRoad && NeedsSearch(m_roadCatChoice->GetSelection()));
+    GetSizer()->Layout();
+
     m_hasProfile = false;
     PopulateLineChoice();
     m_canvas->Refresh();
+}
+
+void ProfileView::OnRoadCatChanged(wxCommandEvent&)
+{
+    bool showSearch = NeedsSearch(m_roadCatChoice->GetSelection());
+    m_searchCtrl->Show(showSearch);
+    if (!showSearch)
+        m_searchCtrl->Clear();
+    GetSizer()->Layout();
+    PopulateLineChoice();
+}
+
+void ProfileView::OnSearchText(wxCommandEvent&)
+{
+    PopulateLineChoice();
 }
 
 void ProfileView::PopulateLineChoice()
@@ -147,14 +193,44 @@ void ProfileView::PopulateLineChoice()
     if (m_mode == Mode::Railway) {
         for (const auto& name : m_lineNames)
             m_lineChoice->Append(wxString::FromUTF8(name));
-        // Update stat labels for railway
         if (m_lblExtra1Label) m_lblExtra1Label->SetLabel("Tunnel length:");
         if (m_lblExtra2Label) m_lblExtra2Label->SetLabel("Bridge length:");
         if (m_lblStationsLabel) m_lblStationsLabel->SetLabel("Stations:");
     } else {
-        for (const auto& road : m_roadList)
+        static const char kCats[] = "ERFKP";
+        int catIdx = m_roadCatChoice->GetSelection();
+        char filterCat = (catIdx >= 0 && catIdx < 5) ? kCats[catIdx] : 'E';
+
+        // For F/K/P: require search text to filter, show nothing if empty
+        std::string searchText;
+        if (NeedsSearch(catIdx)) {
+            searchText = m_searchCtrl->GetValue().ToStdString();
+            if (searchText.empty()) {
+                // Show placeholder message
+                if (m_lblExtra1Label) m_lblExtra1Label->SetLabel("Rail crossings:");
+                if (m_lblExtra2Label) m_lblExtra2Label->SetLabel("Road crossings:");
+                if (m_lblStationsLabel) m_lblStationsLabel->SetLabel("Total crossings:");
+                m_showBtn->Enable(false);
+                return;
+            }
+        }
+
+        int count = 0;
+        for (const auto& road : m_roadList) {
+            if (road.kategori != filterCat) continue;
+
+            // For search mode, filter by number prefix
+            if (!searchText.empty()) {
+                std::string numStr = std::to_string(road.nummer);
+                if (numStr.find(searchText) != 0 && numStr != searchText)
+                    continue;
+            }
+
             m_lineChoice->Append(wxString::FromUTF8(road.Label()));
-        // Update stat labels for road
+            count++;
+            if (count >= 200) break;  // cap to avoid overloading the dropdown
+        }
+
         if (m_lblExtra1Label) m_lblExtra1Label->SetLabel("Rail crossings:");
         if (m_lblExtra2Label) m_lblExtra2Label->SetLabel("Road crossings:");
         if (m_lblStationsLabel) m_lblStationsLabel->SetLabel("Total crossings:");
@@ -201,11 +277,32 @@ void ProfileView::OnShowProfile(wxCommandEvent&)
             return;
         }
     } else {
-        if (sel >= static_cast<int>(m_roadList.size())) {
+        // Rebuild the same filtered list as PopulateLineChoice
+        static const char kCats[] = "ERFKP";
+        int catIdx = m_roadCatChoice->GetSelection();
+        char filterCat = (catIdx >= 0 && catIdx < 5) ? kCats[catIdx] : 'E';
+
+        std::string searchText;
+        if (NeedsSearch(catIdx))
+            searchText = m_searchCtrl->GetValue().ToStdString();
+
+        std::vector<const RoadId*> filtered;
+        for (const auto& r : m_roadList) {
+            if (r.kategori != filterCat) continue;
+            if (!searchText.empty()) {
+                std::string numStr = std::to_string(r.nummer);
+                if (numStr.find(searchText) != 0 && numStr != searchText)
+                    continue;
+            }
+            filtered.push_back(&r);
+            if (filtered.size() >= 200) break;
+        }
+
+        if (sel >= static_cast<int>(filtered.size())) {
             wxEndBusyCursor();
             return;
         }
-        const auto& road = m_roadList[sel];
+        const auto& road = *filtered[sel];
         SetStatusText(wxString::Format("Building profile for %s...", road.Label()), 0);
 
         m_roadResult = m_roadProfileData.BuildRoadProfile(

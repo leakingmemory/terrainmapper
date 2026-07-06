@@ -3,6 +3,7 @@
 #include "ProfileData.h"
 
 #include <string>
+#include <tuple>
 #include <vector>
 
 struct RoadId {
@@ -44,8 +45,8 @@ public:
 
 private:
     // Chain road segments into a continuous polyline
-    // Returns coordinates in EPSG:25833
-    std::vector<std::pair<double, double>> ChainSegments(
+    // Returns (x, y, z) coordinates in EPSG:25833 with embedded elevation
+    std::vector<std::tuple<double, double, double>> ChainSegments(
         const std::string& roadsPath,
         const RoadId& road) const;
 
