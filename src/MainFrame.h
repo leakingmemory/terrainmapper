@@ -38,6 +38,7 @@ private:
     void OnLoadLandCover(wxCommandEvent& event);
     void OnLoadTransport(wxCommandEvent& event);
     void OnCloseAll(wxCommandEvent& event);
+    void OnRailwayProfile(wxCommandEvent& event);
     void OnExit(wxCommandEvent& event);
     void OnAbout(wxCommandEvent& event);
     void OnTileActivated(wxListEvent& event);

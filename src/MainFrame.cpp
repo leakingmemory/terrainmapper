@@ -1,5 +1,6 @@
 #include "MainFrame.h"
 #include "MapView.h"
+#include "ProfileView.h"
 
 #include <wx/filedlg.h>
 #include <wx/filename.h>
@@ -19,6 +20,7 @@ enum {
     ID_OpenZip = wxID_HIGHEST + 1,
     ID_LoadLandCover,
     ID_LoadTransport,
+    ID_RailwayProfile,
     ID_CloseAll
 };
 
@@ -26,6 +28,7 @@ wxBEGIN_EVENT_TABLE(MainFrame, wxFrame)
     EVT_MENU(ID_OpenZip,       MainFrame::OnOpenZip)
     EVT_MENU(ID_LoadLandCover, MainFrame::OnLoadLandCover)
     EVT_MENU(ID_LoadTransport, MainFrame::OnLoadTransport)
+    EVT_MENU(ID_RailwayProfile, MainFrame::OnRailwayProfile)
     EVT_MENU(ID_CloseAll,      MainFrame::OnCloseAll)
     EVT_MENU(wxID_EXIT,        MainFrame::OnExit)
     EVT_MENU(wxID_ABOUT,       MainFrame::OnAbout)
@@ -42,6 +45,7 @@ MainFrame::MainFrame()
     fileMenu->Append(ID_OpenZip, "&Open ZIP...\tCtrl+O", "Open one or more ZIP archives");
     fileMenu->Append(ID_LoadLandCover, "Load &Land Cover...", "Load an AR50 land cover dataset (.gdb in .zip)");
     fileMenu->Append(ID_LoadTransport, "Load &Transport Data...", "Load railway network (.gdb in .zip)");
+    fileMenu->Append(ID_RailwayProfile, "Railway &Profiles...\tCtrl+P", "Show railway elevation profiles");
     fileMenu->Append(ID_CloseAll, "&Close All\tCtrl+W", "Remove all loaded tiles");
     fileMenu->AppendSeparator();
     fileMenu->Append(wxID_EXIT, "E&xit\tAlt+F4");
@@ -752,6 +756,25 @@ void MainFrame::OnTileActivated(wxListEvent& event)
 
     auto* view = new MapView(nullptr, title, vsiPath, m_ar50Path, m_railwayPath,
                              m_roadsPath);
+    view->Show();
+}
+
+void MainFrame::OnRailwayProfile(wxCommandEvent&)
+{
+    if (m_railwayPath.empty()) {
+        wxMessageBox("No railway data loaded.\n"
+                     "Use File > Load Transport Data first.",
+                     "Railway Profiles", wxICON_INFORMATION | wxOK, this);
+        return;
+    }
+    if (m_zipPaths.empty()) {
+        wxMessageBox("No DTM tiles loaded.\n"
+                     "Use File > Open ZIP to load elevation data first.",
+                     "Railway Profiles", wxICON_INFORMATION | wxOK, this);
+        return;
+    }
+
+    auto* view = new ProfileView(nullptr, m_railwayPath, m_zipPaths);
     view->Show();
 }
 
