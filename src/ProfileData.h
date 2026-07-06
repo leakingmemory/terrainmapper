@@ -97,6 +97,10 @@ private:
     // Load a tile's raster data into cache, evicting LRU if needed
     const CachedTile* LoadTileIntoCache(int tileIdx) const;
 
+    // Smooth raw DTM samples to simulate railway earthworks (cuts/fills)
+    // and apply gradient constraints
+    void SmoothProfile(std::vector<ProfilePoint>& points) const;
+
     // Interpolate elevation through tunnel sections
     void InterpolateTunnels(std::vector<ProfilePoint>& points) const;
 
