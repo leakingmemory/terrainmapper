@@ -36,3 +36,26 @@ target_compile_options(terrainmapper PRIVATE
     ${LIBZIP_CFLAGS_OTHER}
     ${GDAL_CFLAGS_OTHER}
 )
+
+# --- Tests ---
+enable_testing()
+
+add_executable(test_osm_extract
+    test/test_osm_extract.cpp
+    src/OsmData.cpp
+)
+target_include_directories(test_osm_extract PRIVATE
+    ${GDAL_INCLUDE_DIRS}
+)
+target_link_libraries(test_osm_extract PRIVATE
+    ${GDAL_LIBRARIES}
+)
+target_compile_options(test_osm_extract PRIVATE
+    ${GDAL_CFLAGS_OTHER}
+)
+
+add_test(
+    NAME osm_extract
+    COMMAND test_osm_extract "${CMAKE_SOURCE_DIR}/test/data/oslo_central.osm.pbf"
+    WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}"
+)

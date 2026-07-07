@@ -3,14 +3,11 @@
 #include <wx/wx.h>
 #include <wx/listctrl.h>
 
+#include "OsmData.h"
+
 #include <optional>
 #include <string>
 #include <vector>
-
-struct TileBounds {
-    double latMin, latMax;
-    double lonMin, lonMax;
-};
 
 class MainFrame : public wxFrame {
 public:

@@ -1,0 +1,15 @@
+OpenStreetMap Data License
+==========================
+
+The file oslo_central.osm.pbf contains data extracted from OpenStreetMap
+(https://www.openstreetmap.org).
+
+This data is copyright OpenStreetMap contributors and is available under
+the Open Database License (ODbL) v1.0:
+https://opendatacommons.org/licenses/odbl/1-0/
+
+The extract covers a small area of central Oslo, Norway (bbox:
+10.72,59.90,10.78,59.92) and is included solely for automated testing
+of the extraction pipeline.
+
+Attribution: (c) OpenStreetMap contributors

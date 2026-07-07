@@ -4,7 +4,10 @@
 #include <string>
 #include <vector>
 
-struct TileBounds;
+struct TileBounds {
+    double latMin, latMax;
+    double lonMin, lonMax;
+};
 
 class OsmData {
 public:
