@@ -14,6 +14,7 @@ pkg_check_modules(GDAL  REQUIRED gdal)
 
 add_executable(terrainmapper
     src/main.cpp
+    src/GameExport.cpp
     src/MainFrame.cpp
     src/MapView.cpp
     src/OsmData.cpp

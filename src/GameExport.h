@@ -1,0 +1,129 @@
+#pragma once
+
+#include "ProfileData.h"
+
+#include <cstdint>
+#include <functional>
+#include <string>
+#include <vector>
+
+// ─── Track segment for export ──────────────────────────────────────
+struct ExportTrack {
+    uint32_t trackId;
+    uint8_t  trackType;   // 0=main, 1=siding, 2=yard
+    uint8_t  medium;      // ' ', 'U', 'L', 'T'
+    uint8_t  electrified; // 0=no, 1=yes
+    std::string lineName; // railway line name (e.g. "Bergensbanen")
+    std::vector<float> x, y, z; // EPSG:25833 coordinates
+};
+
+// ─── Road segment for export ───────────────────────────────────────
+struct ExportRoad {
+    char     kategori;    // 'E', 'R', 'F', 'K', 'P'
+    uint32_t nummer;
+    std::vector<float> x, y, z;
+};
+
+// ─── Station for export ────────────────────────────────────────────
+struct ExportStation {
+    std::string name;
+    float x, y, z;       // EPSG:25833
+    char type;            // 'S' or 'I'
+    std::string lineName;
+};
+
+// ─── Track connection point ────────────────────────────────────────
+struct TrackConnection {
+    uint32_t trackIdA;
+    uint32_t trackIdB;
+    float x, y, z;       // snap point
+};
+
+// ─── LOD level definition ──────────────────────────────────────────
+struct LodLevel {
+    int lod;
+    double resolution;    // metres per pixel
+    double tileExtent;    // metres (256 * resolution)
+    double minDist;       // minimum distance to rail (metres)
+    double maxDist;       // maximum distance to rail (metres)
+};
+
+// ─── Tile descriptor ───────────────────────────────────────────────
+struct ExportTile {
+    int lod;
+    int col, row;
+    double originX, originY; // south-west corner in EPSG:25833
+    double extent;           // tile size in metres
+    double resolution;       // metres per pixel
+};
+
+// ─── GameExporter ──────────────────────────────────────────────────
+class GameExporter {
+public:
+    using ProgressCb = std::function<bool(int pct, const std::string& msg)>;
+
+    // Run the full export pipeline
+    bool Export(const std::string& outputDir,
+               const std::string& railwayPath,
+               const std::string& roadsPath,
+               const std::string& osmDataPath,
+               const std::vector<std::string>& zipPaths,
+               ProgressCb progress = nullptr);
+
+private:
+    ProfileData m_profileData;
+    std::vector<ExportTrack> m_tracks;
+    std::vector<ExportRoad> m_roads;
+    std::vector<ExportStation> m_stations;
+    std::vector<TrackConnection> m_connections;
+    std::vector<ExportTile> m_tiles;
+    uint32_t m_nextTrackId = 1;
+
+    // Rail segment bounding boxes for distance queries
+public:
+    struct RailBBox { double minX, minY, maxX, maxY; };
+private:
+    std::vector<RailBBox> m_railBBoxes;
+
+    // Phase 1: collect rail geometry and build spatial index
+    bool CollectRailGeometry(const std::string& railwayPath,
+                             const std::string& osmDataPath,
+                             ProgressCb progress);
+
+    // Phase 2: profile all main lines
+    bool ProfileMainLines(const std::string& railwayPath,
+                          const std::string& roadsPath,
+                          ProgressCb progress);
+
+    // Phase 3: profile sidings from OSM
+    bool ProfileSidings(const std::string& osmDataPath,
+                        ProgressCb progress);
+
+    // Phase 4: generate tile grid
+    bool GenerateTileGrid(ProgressCb progress);
+
+    // Phase 5: write terrain heightmaps
+    bool WriteTerrainTiles(const std::string& outputDir,
+                           ProgressCb progress);
+
+    // Phase 6: clip and write vector data per tile
+    bool WriteVectorData(const std::string& outputDir,
+                         ProgressCb progress);
+
+    // Phase 7: write manifest
+    bool WriteManifest(const std::string& outputDir,
+                       ProgressCb progress);
+
+    // Minimum distance from a point to any rail segment bbox
+    double MinDistToRail(double x, double y) const;
+
+    // Snap siding endpoints to nearest main-line vertex
+    void SnapConnections();
+
+    // LOD level definitions
+    static const std::vector<LodLevel>& GetLodLevels();
+
+    // Overall bounding box of rail network + buffer
+    double m_boundsMinX = 1e18, m_boundsMinY = 1e18;
+    double m_boundsMaxX = -1e18, m_boundsMaxY = -1e18;
+};

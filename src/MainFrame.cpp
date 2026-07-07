@@ -1,8 +1,10 @@
 #include "MainFrame.h"
+#include "GameExport.h"
 #include "MapView.h"
 #include "OsmData.h"
 #include "ProfileView.h"
 
+#include <wx/dirdlg.h>
 #include <wx/filedlg.h>
 #include <wx/filename.h>
 #include <wx/progdlg.h>
@@ -22,6 +24,7 @@ enum {
     ID_LoadLandCover,
     ID_LoadTransport,
     ID_RailwayProfile,
+    ID_GameExport,
     ID_EnrichOsm,
     ID_CloseAll
 };
@@ -31,6 +34,7 @@ wxBEGIN_EVENT_TABLE(MainFrame, wxFrame)
     EVT_MENU(ID_LoadLandCover, MainFrame::OnLoadLandCover)
     EVT_MENU(ID_LoadTransport, MainFrame::OnLoadTransport)
     EVT_MENU(ID_RailwayProfile, MainFrame::OnRailwayProfile)
+    EVT_MENU(ID_GameExport,    MainFrame::OnGameExport)
     EVT_MENU(ID_EnrichOsm,     MainFrame::OnEnrichOsm)
     EVT_MENU(ID_CloseAll,      MainFrame::OnCloseAll)
     EVT_MENU(wxID_EXIT,        MainFrame::OnExit)
@@ -49,6 +53,7 @@ MainFrame::MainFrame()
     fileMenu->Append(ID_LoadLandCover, "Load &Land Cover...", "Load an AR50 land cover dataset (.gdb in .zip)");
     fileMenu->Append(ID_LoadTransport, "Load &Transport Data...", "Load railway network (.gdb in .zip)");
     fileMenu->Append(ID_RailwayProfile, "Elevation &Profiles...\tCtrl+P", "Show railway and road elevation profiles");
+    fileMenu->Append(ID_GameExport, "Export for &Game Engine...\tCtrl+G", "Export tiled terrain, tracks and roads for game engines");
     fileMenu->Append(ID_EnrichOsm, "Enrich from &OpenStreetMap...", "Import buildings and railway detail from an OSM PBF file");
     fileMenu->Append(ID_CloseAll, "&Close All\tCtrl+W", "Remove all loaded tiles");
     fileMenu->AppendSeparator();
@@ -791,6 +796,51 @@ void MainFrame::OnRailwayProfile(wxCommandEvent&)
     auto* view = new ProfileView(nullptr, m_railwayPath, m_roadsPath,
                                  m_zipPaths, m_osmDataPath);
     view->Show();
+}
+
+void MainFrame::OnGameExport(wxCommandEvent&)
+{
+    if (m_railwayPath.empty()) {
+        wxMessageBox("No transport data loaded.\n"
+                     "Use File > Load Transport Data first.",
+                     "Game Export", wxICON_INFORMATION | wxOK, this);
+        return;
+    }
+    if (m_zipPaths.empty()) {
+        wxMessageBox("No DTM tiles loaded.\n"
+                     "Use File > Open ZIP to load elevation data first.",
+                     "Game Export", wxICON_INFORMATION | wxOK, this);
+        return;
+    }
+
+    wxDirDialog dlg(this, "Choose export directory", "",
+                    wxDD_DEFAULT_STYLE | wxDD_DIR_MUST_EXIST);
+    if (dlg.ShowModal() != wxID_OK)
+        return;
+
+    std::string outputDir = dlg.GetPath().ToStdString();
+
+    wxProgressDialog prog("Game Export",
+                          "Initializing...",
+                          100, this,
+                          wxPD_APP_MODAL | wxPD_AUTO_HIDE |
+                          wxPD_SMOOTH | wxPD_CAN_ABORT |
+                          wxPD_ELAPSED_TIME | wxPD_REMAINING_TIME);
+    prog.Show();
+
+    GameExporter exporter;
+    bool ok = exporter.Export(outputDir, m_railwayPath, m_roadsPath,
+                              m_osmDataPath, m_zipPaths,
+                              [&](int pct, const std::string& msg) -> bool {
+                                  return prog.Update(std::min(pct, 99), msg);
+                              });
+
+    if (ok)
+        wxMessageBox("Export complete.\n\nOutput: " + outputDir,
+                     "Game Export", wxICON_INFORMATION | wxOK, this);
+    else
+        wxMessageBox("Export failed or was cancelled.",
+                     "Game Export", wxICON_ERROR | wxOK, this);
 }
 
 void MainFrame::OnEnrichOsm(wxCommandEvent&)

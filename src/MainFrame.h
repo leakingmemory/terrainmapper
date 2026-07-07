@@ -39,6 +39,7 @@ private:
     void OnEnrichOsm(wxCommandEvent& event);
     void OnCloseAll(wxCommandEvent& event);
     void OnRailwayProfile(wxCommandEvent& event);
+    void OnGameExport(wxCommandEvent& event);
     void OnExit(wxCommandEvent& event);
     void OnAbout(wxCommandEvent& event);
     void OnTileActivated(wxListEvent& event);
