@@ -782,7 +782,8 @@ void MainFrame::OnRailwayProfile(wxCommandEvent&)
         return;
     }
 
-    auto* view = new ProfileView(nullptr, m_railwayPath, m_roadsPath, m_zipPaths);
+    auto* view = new ProfileView(nullptr, m_railwayPath, m_roadsPath,
+                                 m_zipPaths, m_osmDataPath);
     view->Show();
 }
 

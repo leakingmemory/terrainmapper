@@ -16,7 +16,8 @@ public:
     ProfileView(wxWindow* parent,
                 const std::string& railwayPath,
                 const std::string& roadsPath,
-                const std::vector<std::string>& zipPaths);
+                const std::vector<std::string>& zipPaths,
+                const std::string& osmDataPath = "");
 
 private:
     enum class Mode { Railway, Road };
@@ -26,6 +27,7 @@ private:
     RoadProfileData m_roadProfileData;
     std::string m_railwayPath;
     std::string m_roadsPath;
+    std::string m_osmDataPath;
 
     // Railway data
     std::vector<std::string> m_lineNames;
@@ -80,6 +82,7 @@ private:
     void OnRoadCatChanged(wxCommandEvent& event);
     void OnSearchText(wxCommandEvent& event);
     void OnShowProfile(wxCommandEvent& event);
+    void OnJunctionActivated(wxListEvent& event);
     void OnPaint(wxPaintEvent& event);
     void OnMouseMove(wxMouseEvent& event);
     void UpdateStats();

@@ -1,4 +1,5 @@
 #include "ProfileView.h"
+#include "LocalMapView.h"
 
 #include <wx/dcbuffer.h>
 #include <wx/progdlg.h>
@@ -9,11 +10,13 @@
 ProfileView::ProfileView(wxWindow* parent,
                          const std::string& railwayPath,
                          const std::string& roadsPath,
-                         const std::vector<std::string>& zipPaths)
+                         const std::vector<std::string>& zipPaths,
+                         const std::string& osmDataPath)
     : wxFrame(parent, wxID_ANY, "Elevation Profiles",
               wxDefaultPosition, wxSize(1100, 700))
     , m_railwayPath(railwayPath)
     , m_roadsPath(roadsPath)
+    , m_osmDataPath(osmDataPath)
 {
     // --- Build UI ---
     auto* mainSizer = new wxBoxSizer(wxVERTICAL);
@@ -124,6 +127,8 @@ ProfileView::ProfileView(wxWindow* parent,
     m_showBtn->Bind(wxEVT_BUTTON, &ProfileView::OnShowProfile, this);
     m_canvas->Bind(wxEVT_PAINT, &ProfileView::OnPaint, this);
     m_canvas->Bind(wxEVT_MOTION, &ProfileView::OnMouseMove, this);
+    m_junctionList->Bind(wxEVT_LIST_ITEM_ACTIVATED,
+                         &ProfileView::OnJunctionActivated, this);
 
     // Build tile index
     wxProgressDialog progress(
@@ -932,4 +937,39 @@ void ProfileView::PopulateJunctionList()
             m_junctionList->SetItem(idx, 3, wxString::FromUTF8(name));
         }
     }
+}
+
+void ProfileView::OnJunctionActivated(wxListEvent& event)
+{
+    if (!m_hasProfile) return;
+
+    long sel = event.GetIndex();
+    if (sel < 0) return;
+
+    double cx = 0, cy = 0;
+    wxString title;
+
+    if (m_mode == Mode::Railway) {
+        if (sel >= static_cast<long>(m_railResult.junctions.size())) return;
+        const auto& jn = m_railResult.junctions[sel];
+        cx = jn.x;
+        cy = jn.y;
+        title = wxString::Format("%.1f km — %s",
+                                 jn.km, jn.description);
+    } else {
+        if (sel >= static_cast<long>(m_roadResult.intersections.size())) return;
+        const auto& ix = m_roadResult.intersections[sel];
+        cx = ix.x;
+        cy = ix.y;
+        std::string name = ix.isRailway ? ix.railLine
+                                         : ix.crossingRoad.Label();
+        title = wxString::Format("%.1f km — %s", ix.km, name);
+    }
+
+    if (cx == 0 && cy == 0) return;
+
+    auto* map = new LocalMapView(nullptr, title, cx, cy,
+                                 m_profileData, m_railwayPath,
+                                 m_roadsPath, m_osmDataPath);
+    map->Show();
 }
