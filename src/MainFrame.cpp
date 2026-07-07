@@ -49,7 +49,7 @@ MainFrame::MainFrame()
     fileMenu->Append(ID_LoadLandCover, "Load &Land Cover...", "Load an AR50 land cover dataset (.gdb in .zip)");
     fileMenu->Append(ID_LoadTransport, "Load &Transport Data...", "Load railway network (.gdb in .zip)");
     fileMenu->Append(ID_RailwayProfile, "Elevation &Profiles...\tCtrl+P", "Show railway and road elevation profiles");
-    fileMenu->Append(ID_EnrichOsm, "Enrich from &OpenStreetMap...", "Import building outlines from an OSM PBF file");
+    fileMenu->Append(ID_EnrichOsm, "Enrich from &OpenStreetMap...", "Import buildings and railway detail from an OSM PBF file");
     fileMenu->Append(ID_CloseAll, "&Close All\tCtrl+W", "Remove all loaded tiles");
     fileMenu->AppendSeparator();
     fileMenu->Append(wxID_EXIT, "E&xit\tAlt+F4");
@@ -662,7 +662,7 @@ void MainFrame::OnCloseAll(wxCommandEvent&)
     CleanupAr50Temp();
     CleanupRoadsTemp();
     m_railwayPath.clear();
-    m_osmBuildingsPath.clear();
+    m_osmDataPath.clear();
     UpdateTitleAndStatus();
 }
 
@@ -762,8 +762,8 @@ void MainFrame::OnTileActivated(wxListEvent& event)
     if (std::regex_search(entryName, m, sheetRe))
         title = wxString::Format("Tile %s", m[1].str());
 
-    auto* view = new MapView(nullptr, title, vsiPath, m_ar50Path, m_railwayPath,
-                             m_roadsPath, m_osmBuildingsPath);
+    auto* view = new MapView(nullptr, title, vsiPath, m_ar50Path,
+                             m_railwayPath, m_roadsPath, m_osmDataPath);
     view->Show();
 }
 
@@ -811,7 +811,7 @@ void MainFrame::OnEnrichOsm(wxCommandEvent&)
     // Cache GPKG next to the PBF file, named by the bbox
     wxFileName pbfFn(pbfPath);
     char bboxTag[128];
-    snprintf(bboxTag, sizeof(bboxTag), "_buildings_%.2f_%.2f_%.2f_%.2f.gpkg",
+    snprintf(bboxTag, sizeof(bboxTag), "_osm_%.2f_%.2f_%.2f_%.2f.gpkg",
              bbox.lonMin, bbox.latMin, bbox.lonMax, bbox.latMax);
     const std::string gpkgPath =
         (pbfFn.GetPath() + wxFileName::GetPathSeparator()
@@ -822,18 +822,25 @@ void MainFrame::OnEnrichOsm(wxCommandEvent&)
         GDALOpenEx(gpkgPath.c_str(), GDAL_OF_VECTOR | GDAL_OF_READONLY,
                    nullptr, nullptr, nullptr));
     if (cached) {
-        OGRLayer* layer = cached->GetLayerByName("buildings");
-        int count = layer ? static_cast<int>(layer->GetFeatureCount()) : 0;
+        auto layerCount = [&](const char* name) -> int {
+            OGRLayer* l = cached->GetLayerByName(name);
+            return l ? static_cast<int>(l->GetFeatureCount()) : 0;
+        };
+        int buildings = layerCount("buildings");
+        int tracks = layerCount("railway_tracks");
+        int points = layerCount("railway_points");
+        int platforms = layerCount("railway_platforms");
         GDALClose(cached);
-        m_osmBuildingsPath = gpkgPath;
+        m_osmDataPath = gpkgPath;
         SetStatusText(wxString::Format(
-            "OSM buildings loaded from cache: %d buildings", count));
+            "OSM cached: %d buildings, %d tracks, %d rail points, %d platforms",
+            buildings, tracks, points, platforms));
         return;
     }
 
     // Show bbox to user for confirmation
     wxString msg = wxString::Format(
-        "Extract buildings from:\n%s\n\n"
+        "Extract OSM data (buildings, railway detail) from:\n%s\n\n"
         "Tile coverage area:\n"
         "  %.4f\u00b0 to %.4f\u00b0 N\n"
         "  %.4f\u00b0 to %.4f\u00b0 E\n\n"
@@ -855,16 +862,16 @@ void MainFrame::OnEnrichOsm(wxCommandEvent&)
         return progress.Update(pct, wxString::FromUTF8(msg));
     };
 
-    int count = OsmData::ExtractBuildings(pbfPath, bbox, gpkgPath, progressCb);
+    int count = OsmData::Extract(pbfPath, bbox, gpkgPath, progressCb);
 
     if (count < 0) {
-        wxMessageBox("Failed to extract buildings from OSM data.",
+        wxMessageBox("Failed to extract data from OSM file.",
                      "Error", wxICON_ERROR | wxOK, this);
         return;
     }
 
-    m_osmBuildingsPath = gpkgPath;
-    SetStatusText(wxString::Format("OSM buildings: %d extracted", count));
+    m_osmDataPath = gpkgPath;
+    SetStatusText(wxString::Format("OSM enrichment: %d features extracted", count));
 }
 
 void MainFrame::OnExit(wxCommandEvent&)

@@ -21,15 +21,14 @@ public:
     // Extract and convert OSM data for the given bounding box.
     // - osmPbfPath: path to an OSM PBF file (regional or planet)
     // - bbox: WGS84 bounding box to extract
-    // - outputGpkg: path for the output GPKG (buildings layer)
+    // - outputGpkg: path for the output GPKG (multiple layers)
     // - progress: optional callback
-    // Returns number of buildings extracted, or -1 on error.
-    static int ExtractBuildings(const std::string& osmPbfPath,
-                                const BBox& bbox,
-                                const std::string& outputGpkg,
-                                ProgressCb progress = nullptr);
+    // Returns total feature count, or -1 on error.
+    static int Extract(const std::string& osmPbfPath,
+                       const BBox& bbox,
+                       const std::string& outputGpkg,
+                       ProgressCb progress = nullptr);
 
-private:
     // Parse the "key"=>"value","key2"=>"value2" format in other_tags
     static std::string GetOtherTag(const char* otherTags, const char* key);
 };

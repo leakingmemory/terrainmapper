@@ -16,7 +16,7 @@ MapView::MapView(wxWindow* parent, const wxString& title,
                  const std::string& ar50Path,
                  const std::string& railwayPath,
                  const std::string& roadsPath,
-                 const std::string& osmBuildingsPath)
+                 const std::string& osmDataPath)
     : wxFrame(parent, wxID_ANY, title, wxDefaultPosition, wxSize(900, 700))
 {
     m_canvas = new wxScrolledCanvas(this, wxID_ANY);
@@ -44,9 +44,12 @@ MapView::MapView(wxWindow* parent, const wxString& title,
         if (!railwayPath.empty())
             LoadRailway(railwayPath);
         progress.Update(90, "Loading buildings...");
-        if (!osmBuildingsPath.empty())
-            LoadBuildings(osmBuildingsPath);
-        progress.Update(93, "Rendering...");
+        if (!osmDataPath.empty())
+            LoadBuildings(osmDataPath);
+        progress.Update(92, "Loading OSM railway detail...");
+        if (!osmDataPath.empty())
+            LoadOsmRailway(osmDataPath);
+        progress.Update(95, "Rendering...");
         m_bitmap = wxBitmap(RenderElevation());
         m_canvas->SetScrollbars(1, 1, m_rasterW, m_rasterH, 0, 0);
         progress.Update(100);
@@ -583,6 +586,213 @@ bool MapView::LoadBuildings(const std::string& osmBuildingsPath)
     return m_hasBuildings;
 }
 
+bool MapView::LoadOsmRailway(const std::string& osmDataPath)
+{
+    GDALDataset* ds = static_cast<GDALDataset*>(
+        GDALOpenEx(osmDataPath.c_str(), GDAL_OF_VECTOR | GDAL_OF_READONLY,
+                   nullptr, nullptr, nullptr));
+    if (!ds)
+        return false;
+
+    // Set up coordinate transform from WGS84 to tile CRS
+    OGRSpatialReference tileSrs;
+    tileSrs.importFromWkt(m_tileProjectionWkt.c_str());
+    tileSrs.SetAxisMappingStrategy(OAMS_TRADITIONAL_GIS_ORDER);
+
+    OGRSpatialReference wgs84;
+    wgs84.SetWellKnownGeogCS("WGS84");
+    wgs84.SetAxisMappingStrategy(OAMS_TRADITIONAL_GIS_ORDER);
+
+    OGRCoordinateTransformation* toTile =
+        OGRCreateCoordinateTransformation(&wgs84, &tileSrs);
+    OGRCoordinateTransformation* fromTile =
+        OGRCreateCoordinateTransformation(&tileSrs, &wgs84);
+
+    // Tile extent for spatial filter (in WGS84)
+    double filterX1 = m_gt[0], filterY1 = m_gt[3] + m_rasterH * m_gt[5];
+    double filterX2 = m_gt[0] + m_rasterW * m_gt[1], filterY2 = m_gt[3];
+    if (fromTile) {
+        fromTile->Transform(1, &filterX1, &filterY1);
+        fromTile->Transform(1, &filterX2, &filterY2);
+    }
+    double fMinX = std::min(filterX1, filterX2);
+    double fMinY = std::min(filterY1, filterY2);
+    double fMaxX = std::max(filterX1, filterX2);
+    double fMaxY = std::max(filterY1, filterY2);
+
+    auto clamp = [](double v) -> int {
+        constexpr double kMax = 100000.0;
+        return static_cast<int>(std::clamp(v, -kMax, kMax));
+    };
+
+    // Load railway tracks
+    OGRLayer* trackLayer = ds->GetLayerByName("railway_tracks");
+    if (trackLayer) {
+        trackLayer->SetSpatialFilterRect(fMinX, fMinY, fMaxX, fMaxY);
+        trackLayer->ResetReading();
+
+        OGRFeature* feat;
+        while ((feat = trackLayer->GetNextFeature()) != nullptr) {
+            OGRGeometry* geom = feat->GetGeometryRef();
+            if (!geom) { OGRFeature::DestroyFeature(feat); continue; }
+
+            OGRGeometry* clone = geom->clone();
+            if (toTile) clone->transform(toTile);
+
+            auto processLine = [&](OGRLineString* line) {
+                OsmTrackSegment seg;
+                const char* rw = feat->GetFieldAsString("railway");
+                if (rw && rw[0]) seg.railway = rw;
+                const char* svc = feat->GetFieldAsString("service");
+                if (svc && svc[0]) seg.service = svc;
+                const char* nm = feat->GetFieldAsString("name");
+                if (nm && nm[0]) seg.name = nm;
+                const char* tn = feat->GetFieldAsString("tunnel");
+                if (tn && (tn[0] == 'y' || tn[0] == 'Y')) seg.tunnel = true;
+                const char* br = feat->GetFieldAsString("bridge");
+                if (br && (br[0] == 'y' || br[0] == 'Y')) seg.bridge = true;
+
+                int nPts = line->getNumPoints();
+                for (int p = 0; p < nPts; p++) {
+                    double x = line->getX(p), y = line->getY(p);
+                    int px = clamp(m_invGt[0] + x * m_invGt[1] + y * m_invGt[2]);
+                    int py = clamp(m_invGt[3] + x * m_invGt[4] + y * m_invGt[5]);
+                    seg.points.push_back({px, py});
+                }
+                if (!seg.points.empty())
+                    m_osmTracks.push_back(std::move(seg));
+            };
+
+            OGRwkbGeometryType gtype = wkbFlatten(clone->getGeometryType());
+            if (gtype == wkbLineString)
+                processLine(static_cast<OGRLineString*>(clone));
+            else if (gtype == wkbMultiLineString) {
+                auto* multi = static_cast<OGRMultiLineString*>(clone);
+                for (int g = 0; g < multi->getNumGeometries(); g++)
+                    processLine(static_cast<OGRLineString*>(multi->getGeometryRef(g)));
+            }
+
+            delete clone;
+            OGRFeature::DestroyFeature(feat);
+        }
+    }
+
+    // Load railway points (switches, signals, stations)
+    OGRLayer* pointLayer = ds->GetLayerByName("railway_points");
+    if (pointLayer) {
+        pointLayer->SetSpatialFilterRect(fMinX, fMinY, fMaxX, fMaxY);
+        pointLayer->ResetReading();
+
+        OGRFeature* feat;
+        while ((feat = pointLayer->GetNextFeature()) != nullptr) {
+            OGRGeometry* geom = feat->GetGeometryRef();
+            if (!geom || wkbFlatten(geom->getGeometryType()) != wkbPoint) {
+                OGRFeature::DestroyFeature(feat);
+                continue;
+            }
+
+            OGRPoint* pt = static_cast<OGRPoint*>(geom->clone());
+            if (toTile) pt->transform(toTile);
+
+            double x = pt->getX(), y = pt->getY();
+            delete pt;
+
+            int px = clamp(m_invGt[0] + x * m_invGt[1] + y * m_invGt[2]);
+            int py = clamp(m_invGt[3] + x * m_invGt[4] + y * m_invGt[5]);
+
+            OsmRailPoint rp;
+            rp.pos = {px, py};
+            const char* rw = feat->GetFieldAsString("railway");
+            if (rw && rw[0]) rp.railway = rw;
+            const char* nm = feat->GetFieldAsString("name");
+            if (nm && nm[0]) rp.name = nm;
+
+            m_osmRailPoints.push_back(std::move(rp));
+            OGRFeature::DestroyFeature(feat);
+        }
+    }
+
+    // Load platforms
+    OGRLayer* platLayer = ds->GetLayerByName("railway_platforms");
+    if (platLayer) {
+        platLayer->SetSpatialFilterRect(fMinX, fMinY, fMaxX, fMaxY);
+        platLayer->ResetReading();
+
+        auto ringToPixels = [&](OGRLinearRing* ring) -> std::vector<wxPoint> {
+            std::vector<wxPoint> pts;
+            if (!ring) return pts;
+            int n = ring->getNumPoints();
+            pts.reserve(n);
+            for (int i = 0; i < n; i++) {
+                double x = ring->getX(i), y = ring->getY(i);
+                int px = clamp(m_invGt[0] + x * m_invGt[1] + y * m_invGt[2]);
+                int py = clamp(m_invGt[3] + x * m_invGt[4] + y * m_invGt[5]);
+                pts.push_back({px, py});
+            }
+            return pts;
+        };
+
+        OGRFeature* feat;
+        while ((feat = platLayer->GetNextFeature()) != nullptr) {
+            OGRGeometry* geom = feat->GetGeometryRef();
+            if (!geom) { OGRFeature::DestroyFeature(feat); continue; }
+
+            OGRGeometry* transformed = geom->clone();
+            if (toTile) transformed->transform(toTile);
+
+            OsmPlatform plat;
+            const char* nm = feat->GetFieldAsString("name");
+            if (nm && nm[0]) plat.name = nm;
+            const char* ref = feat->GetFieldAsString("ref");
+            if (ref && ref[0]) plat.ref = ref;
+
+            OGRwkbGeometryType gtype = wkbFlatten(transformed->getGeometryType());
+            if (gtype == wkbLineString) {
+                plat.isLine = true;
+                OGRLineString* line = static_cast<OGRLineString*>(transformed);
+                int nPts = line->getNumPoints();
+                for (int p = 0; p < nPts; p++) {
+                    double x = line->getX(p), y = line->getY(p);
+                    int px = clamp(m_invGt[0] + x * m_invGt[1] + y * m_invGt[2]);
+                    int py = clamp(m_invGt[3] + x * m_invGt[4] + y * m_invGt[5]);
+                    plat.linePoints.push_back({px, py});
+                }
+                if (!plat.linePoints.empty())
+                    m_osmPlatforms.push_back(std::move(plat));
+            } else if (gtype == wkbPolygon) {
+                OGRPolygon* poly = static_cast<OGRPolygon*>(transformed);
+                plat.rings.push_back(ringToPixels(poly->getExteriorRing()));
+                if (!plat.rings.empty() && plat.rings[0].size() >= 3)
+                    m_osmPlatforms.push_back(std::move(plat));
+            } else if (gtype == wkbMultiPolygon) {
+                OGRMultiPolygon* mp = static_cast<OGRMultiPolygon*>(transformed);
+                for (int g = 0; g < mp->getNumGeometries(); g++) {
+                    OsmPlatform subPlat;
+                    subPlat.name = plat.name;
+                    subPlat.ref = plat.ref;
+                    OGRPolygon* poly = static_cast<OGRPolygon*>(mp->getGeometryRef(g));
+                    subPlat.rings.push_back(ringToPixels(poly->getExteriorRing()));
+                    if (!subPlat.rings.empty() && subPlat.rings[0].size() >= 3)
+                        m_osmPlatforms.push_back(std::move(subPlat));
+                }
+            }
+
+            delete transformed;
+            OGRFeature::DestroyFeature(feat);
+        }
+    }
+
+    if (fromTile)
+        OCTDestroyCoordinateTransformation(fromTile);
+    if (toTile)
+        OCTDestroyCoordinateTransformation(toTile);
+
+    GDALClose(ds);
+    m_hasOsmRailway = !m_osmTracks.empty() || !m_osmRailPoints.empty()
+                      || !m_osmPlatforms.empty();
+    return m_hasOsmRailway;
+}
+
 wxImage MapView::RenderElevation() const
 {
     wxImage img(m_rasterW, m_rasterH);
@@ -739,7 +949,84 @@ void MapView::OnPaint(wxPaintEvent&)
         }
     }
 
-    // Railway overlay
+    // OSM railway detail overlay (yard tracks, platforms, switches)
+    if (m_hasOsmRailway) {
+        // Platforms first (under tracks)
+        dc.SetPen(wxPen(wxColour(140, 140, 160), 1));
+        dc.SetBrush(wxBrush(wxColour(180, 180, 200)));
+        for (const auto& plat : m_osmPlatforms) {
+            if (plat.isLine) {
+                if (plat.linePoints.size() >= 2) {
+                    dc.SetPen(wxPen(wxColour(140, 140, 160), 3));
+                    for (size_t i = 1; i < plat.linePoints.size(); i++)
+                        dc.DrawLine(plat.linePoints[i - 1], plat.linePoints[i]);
+                    dc.SetPen(wxPen(wxColour(140, 140, 160), 1));
+                }
+            } else if (!plat.rings.empty() && plat.rings[0].size() >= 3) {
+                dc.DrawPolygon(static_cast<int>(plat.rings[0].size()),
+                               plat.rings[0].data());
+            }
+        }
+
+        // OSM track segments — style by service type
+        for (const auto& seg : m_osmTracks) {
+            if (seg.points.size() < 2)
+                continue;
+
+            if (seg.service == "yard")
+                dc.SetPen(wxPen(wxColour(180, 120, 60), 1, wxPENSTYLE_SHORT_DASH));
+            else if (seg.service == "siding")
+                dc.SetPen(wxPen(wxColour(180, 80, 80), 1));
+            else if (seg.service == "crossover")
+                dc.SetPen(wxPen(wxColour(160, 100, 100), 1, wxPENSTYLE_DOT));
+            else if (seg.service == "spur")
+                dc.SetPen(wxPen(wxColour(160, 60, 60), 1));
+            else if (seg.railway == "subway")
+                dc.SetPen(wxPen(wxColour(0, 80, 200), 2, wxPENSTYLE_SHORT_DASH));
+            else if (seg.railway == "tram" || seg.railway == "light_rail")
+                dc.SetPen(wxPen(wxColour(200, 60, 60), 1));
+            else if (seg.tunnel)
+                dc.SetPen(wxPen(wxColour(120, 40, 40), 1, wxPENSTYLE_SHORT_DASH));
+            else if (seg.bridge)
+                dc.SetPen(wxPen(wxColour(70, 130, 180), 2));
+            else if (seg.railway == "disused" || seg.railway == "abandoned")
+                dc.SetPen(wxPen(wxColour(150, 130, 130), 1, wxPENSTYLE_DOT));
+            else if (seg.railway == "preserved")
+                dc.SetPen(wxPen(wxColour(140, 100, 40), 1));
+            else
+                dc.SetPen(wxPen(wxColour(160, 20, 20), 2));
+
+            for (size_t i = 1; i < seg.points.size(); i++)
+                dc.DrawLine(seg.points[i - 1], seg.points[i]);
+        }
+
+        // Switches — small diamonds
+        for (const auto& rp : m_osmRailPoints) {
+            if (rp.railway == "switch") {
+                dc.SetPen(wxPen(wxColour(80, 80, 80), 1));
+                dc.SetBrush(wxBrush(wxColour(200, 200, 60)));
+                wxPoint diamond[4] = {
+                    {rp.pos.x, rp.pos.y - 3},
+                    {rp.pos.x + 3, rp.pos.y},
+                    {rp.pos.x, rp.pos.y + 3},
+                    {rp.pos.x - 3, rp.pos.y}
+                };
+                dc.DrawPolygon(4, diamond);
+            } else if (rp.railway == "signal") {
+                dc.SetPen(wxPen(wxColour(20, 20, 20), 1));
+                dc.SetBrush(wxBrush(wxColour(60, 200, 60)));
+                dc.DrawCircle(rp.pos, 2);
+            } else if (rp.railway == "crossing" || rp.railway == "level_crossing") {
+                dc.SetPen(wxPen(wxColour(200, 20, 20), 1));
+                dc.DrawLine(rp.pos.x - 3, rp.pos.y - 3,
+                            rp.pos.x + 3, rp.pos.y + 3);
+                dc.DrawLine(rp.pos.x + 3, rp.pos.y - 3,
+                            rp.pos.x - 3, rp.pos.y + 3);
+            }
+        }
+    }
+
+    // Railway overlay (GML — national rail network)
     if (m_hasRailway) {
         // Draw track lines — style varies by status and medium
         for (const auto& seg : m_railSegments) {

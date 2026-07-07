@@ -17,7 +17,7 @@ public:
             const std::string& ar50Path = "",
             const std::string& railwayPath = "",
             const std::string& roadsPath = "",
-            const std::string& osmBuildingsPath = "");
+            const std::string& osmDataPath = "");
     ~MapView();
 
 private:
@@ -69,6 +69,32 @@ private:
     std::vector<BuildingOutline> m_buildings;
     bool m_hasBuildings = false;
 
+    // OSM railway track overlay (yard tracks, sidings, platforms, switches)
+    struct OsmTrackSegment {
+        std::vector<wxPoint> points;
+        std::string railway;   // rail, subway, tram, etc.
+        std::string service;   // yard, siding, crossover, spur, or empty=main
+        std::string name;
+        bool tunnel = false;
+        bool bridge = false;
+    };
+    struct OsmRailPoint {
+        wxPoint pos;
+        std::string railway;   // switch, signal, station, halt, crossing, etc.
+        std::string name;
+    };
+    struct OsmPlatform {
+        std::vector<std::vector<wxPoint>> rings;  // polygon rings (or single-ring from line)
+        std::string name;
+        std::string ref;
+        bool isLine = false;   // true if sourced from a line (draw as line, not polygon)
+        std::vector<wxPoint> linePoints;  // if isLine
+    };
+    std::vector<OsmTrackSegment> m_osmTracks;
+    std::vector<OsmRailPoint> m_osmRailPoints;
+    std::vector<OsmPlatform> m_osmPlatforms;
+    bool m_hasOsmRailway = false;
+
     // Display
     wxScrolledCanvas* m_canvas = nullptr;
     wxBitmap m_bitmap;
@@ -84,7 +110,8 @@ private:
                        wxProgressDialog* progress = nullptr);
     bool LoadRailway(const std::string& railwayPath);
     bool LoadRoads(const std::string& roadsPath);
-    bool LoadBuildings(const std::string& osmBuildingsPath);
+    bool LoadBuildings(const std::string& osmDataPath);
+    bool LoadOsmRailway(const std::string& osmDataPath);
     wxImage RenderElevation() const;
 
     void OnPaint(wxPaintEvent& event);

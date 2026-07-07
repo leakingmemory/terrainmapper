@@ -31,7 +31,7 @@ private:
     std::string m_railwayPath;    // vsizip path to railway .gdb
     std::string m_roadsPath;      // path to roads GPKG (on disk)
     std::string m_roadsTempDir;   // temp directory for road data
-    std::string m_osmBuildingsPath;  // path to OSM buildings GPKG
+    std::string m_osmDataPath;  // path to OSM enrichment GPKG
 
     void CleanupAr50Temp();
     void CleanupRoadsTemp();
