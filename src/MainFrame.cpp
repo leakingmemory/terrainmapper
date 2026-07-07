@@ -327,7 +327,7 @@ void MainFrame::OnLoadTransport(wxCommandEvent&)
         wxFileName zipFn(zipPath);
         const std::string cachedGpkg =
             (zipFn.GetPath() + wxFileName::GetPathSeparator()
-             + zipFn.GetName() + "_roads_v3.gpkg").ToStdString();
+             + zipFn.GetName() + "_roads_v4.gpkg").ToStdString();
 
         // Check if a cached GPKG already exists
         GDALDataset* cached = static_cast<GDALDataset*>(
@@ -471,6 +471,9 @@ void MainFrame::OnLoadTransport(wxCommandEvent&)
                                             (void)dstLayer->CreateField(&fldCat);
                                             OGRFieldDefn fldNum("vegnummer", OFTInteger);
                                             (void)dstLayer->CreateField(&fldNum);
+                                            OGRFieldDefn fldLanes("feltoversikt", OFTString);
+                                            fldLanes.SetWidth(10);
+                                            (void)dstLayer->CreateField(&fldLanes);
                                         }
                                     }
 
@@ -486,6 +489,9 @@ void MainFrame::OnLoadTransport(wxCommandEvent&)
                                             if (cat) outFeat->SetField("vegkategori", cat);
                                             int vegnum = feat->GetFieldAsInteger("vegnummer");
                                             outFeat->SetField("vegnummer", vegnum);
+                                            const char* lanes = feat->GetFieldAsString("feltoversikt");
+                                            if (lanes && lanes[0])
+                                                outFeat->SetField("feltoversikt", lanes);
                                             (void)dstLayer->CreateFeature(outFeat);
                                             OGRFeature::DestroyFeature(outFeat);
                                             OGRFeature::DestroyFeature(feat);
