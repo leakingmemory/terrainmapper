@@ -481,6 +481,17 @@ ProfileResult ProfileData::BuildProfile(const std::string& railwayPath,
                         }),
         result.points.end());
 
+    // Reject implausible elevations: track below ~2m above sea level is
+    // extremely unlikely (flooding risk from storm surge / high tide).
+    // DTM artifacts near coastlines and fjords can produce spurious low
+    // readings.  Mark these as failed so they get interpolated through.
+    constexpr double kMinPlausibleElev = 2.0;
+    for (auto& pt : result.points) {
+        if (pt.elevation > -9000 && pt.elevation < kMinPlausibleElev
+            && pt.medium != 'U')
+            pt.elevation = -9999;
+    }
+
     // Add track bed offset: rail sits on ballast + sleepers, typically
     // ~0.6m above natural ground (0.3m ballast + 0.25m sleeper + 0.05m rail)
     constexpr double kTrackBedOffset = 0.6;
