@@ -25,11 +25,13 @@ public:
 private:
     wxListCtrl* m_list;
     std::vector<std::string> m_zipPaths;
+    std::vector<TileBounds> m_tileBounds;  // WGS84 bounds per loaded tile
     std::string m_ar50Path;       // path to the AR50 .gdb (on disk)
     std::string m_ar50TempDir;    // temp directory to clean up
     std::string m_railwayPath;    // vsizip path to railway .gdb
     std::string m_roadsPath;      // path to roads GPKG (on disk)
     std::string m_roadsTempDir;   // temp directory for road data
+    std::string m_osmBuildingsPath;  // path to OSM buildings GPKG
 
     void CleanupAr50Temp();
     void CleanupRoadsTemp();
@@ -37,6 +39,7 @@ private:
     void OnOpenZip(wxCommandEvent& event);
     void OnLoadLandCover(wxCommandEvent& event);
     void OnLoadTransport(wxCommandEvent& event);
+    void OnEnrichOsm(wxCommandEvent& event);
     void OnCloseAll(wxCommandEvent& event);
     void OnRailwayProfile(wxCommandEvent& event);
     void OnExit(wxCommandEvent& event);

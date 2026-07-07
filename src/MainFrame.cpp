@@ -1,5 +1,6 @@
 #include "MainFrame.h"
 #include "MapView.h"
+#include "OsmData.h"
 #include "ProfileView.h"
 
 #include <wx/filedlg.h>
@@ -21,6 +22,7 @@ enum {
     ID_LoadLandCover,
     ID_LoadTransport,
     ID_RailwayProfile,
+    ID_EnrichOsm,
     ID_CloseAll
 };
 
@@ -29,6 +31,7 @@ wxBEGIN_EVENT_TABLE(MainFrame, wxFrame)
     EVT_MENU(ID_LoadLandCover, MainFrame::OnLoadLandCover)
     EVT_MENU(ID_LoadTransport, MainFrame::OnLoadTransport)
     EVT_MENU(ID_RailwayProfile, MainFrame::OnRailwayProfile)
+    EVT_MENU(ID_EnrichOsm,     MainFrame::OnEnrichOsm)
     EVT_MENU(ID_CloseAll,      MainFrame::OnCloseAll)
     EVT_MENU(wxID_EXIT,        MainFrame::OnExit)
     EVT_MENU(wxID_ABOUT,       MainFrame::OnAbout)
@@ -46,6 +49,7 @@ MainFrame::MainFrame()
     fileMenu->Append(ID_LoadLandCover, "Load &Land Cover...", "Load an AR50 land cover dataset (.gdb in .zip)");
     fileMenu->Append(ID_LoadTransport, "Load &Transport Data...", "Load railway network (.gdb in .zip)");
     fileMenu->Append(ID_RailwayProfile, "Elevation &Profiles...\tCtrl+P", "Show railway and road elevation profiles");
+    fileMenu->Append(ID_EnrichOsm, "Enrich from &OpenStreetMap...", "Import building outlines from an OSM PBF file");
     fileMenu->Append(ID_CloseAll, "&Close All\tCtrl+W", "Remove all loaded tiles");
     fileMenu->AppendSeparator();
     fileMenu->Append(wxID_EXIT, "E&xit\tAlt+F4");
@@ -602,6 +606,8 @@ void MainFrame::LoadZip(const wxString& path)
 
         auto bounds = GetTileBounds(zipPath, st.name);
         if (bounds) {
+            m_tileBounds.push_back(*bounds);
+
             static const std::regex sheetRe(R"(Basisdata_(\d+-\d+)_)");
             std::cmatch m;
             if (std::regex_search(st.name, m, sheetRe))
@@ -652,9 +658,11 @@ void MainFrame::OnCloseAll(wxCommandEvent&)
 {
     m_list->DeleteAllItems();
     m_zipPaths.clear();
+    m_tileBounds.clear();
     CleanupAr50Temp();
     CleanupRoadsTemp();
     m_railwayPath.clear();
+    m_osmBuildingsPath.clear();
     UpdateTitleAndStatus();
 }
 
@@ -755,7 +763,7 @@ void MainFrame::OnTileActivated(wxListEvent& event)
         title = wxString::Format("Tile %s", m[1].str());
 
     auto* view = new MapView(nullptr, title, vsiPath, m_ar50Path, m_railwayPath,
-                             m_roadsPath);
+                             m_roadsPath, m_osmBuildingsPath);
     view->Show();
 }
 
@@ -776,6 +784,87 @@ void MainFrame::OnRailwayProfile(wxCommandEvent&)
 
     auto* view = new ProfileView(nullptr, m_railwayPath, m_roadsPath, m_zipPaths);
     view->Show();
+}
+
+void MainFrame::OnEnrichOsm(wxCommandEvent&)
+{
+    if (m_tileBounds.empty()) {
+        wxMessageBox("No DTM tiles loaded.\n"
+                     "Use File > Open ZIP to load elevation data first.",
+                     "Enrich from OpenStreetMap",
+                     wxICON_INFORMATION | wxOK, this);
+        return;
+    }
+
+    wxFileDialog dlg(this, "Select OpenStreetMap PBF file",
+                     wxEmptyString, wxEmptyString,
+                     "PBF files (*.pbf)|*.pbf|All files (*)|*",
+                     wxFD_OPEN | wxFD_FILE_MUST_EXIST);
+    if (dlg.ShowModal() == wxID_CANCEL)
+        return;
+
+    const std::string pbfPath = dlg.GetPath().ToStdString();
+
+    // Compute bounding box from all loaded tiles
+    auto bbox = OsmData::ComputeTileBBox(m_tileBounds);
+
+    // Cache GPKG next to the PBF file, named by the bbox
+    wxFileName pbfFn(pbfPath);
+    char bboxTag[128];
+    snprintf(bboxTag, sizeof(bboxTag), "_buildings_%.2f_%.2f_%.2f_%.2f.gpkg",
+             bbox.lonMin, bbox.latMin, bbox.lonMax, bbox.latMax);
+    const std::string gpkgPath =
+        (pbfFn.GetPath() + wxFileName::GetPathSeparator()
+         + pbfFn.GetName()).ToStdString() + bboxTag;
+
+    // Check for cached result
+    GDALDataset* cached = static_cast<GDALDataset*>(
+        GDALOpenEx(gpkgPath.c_str(), GDAL_OF_VECTOR | GDAL_OF_READONLY,
+                   nullptr, nullptr, nullptr));
+    if (cached) {
+        OGRLayer* layer = cached->GetLayerByName("buildings");
+        int count = layer ? static_cast<int>(layer->GetFeatureCount()) : 0;
+        GDALClose(cached);
+        m_osmBuildingsPath = gpkgPath;
+        SetStatusText(wxString::Format(
+            "OSM buildings loaded from cache: %d buildings", count));
+        return;
+    }
+
+    // Show bbox to user for confirmation
+    wxString msg = wxString::Format(
+        "Extract buildings from:\n%s\n\n"
+        "Tile coverage area:\n"
+        "  %.4f\u00b0 to %.4f\u00b0 N\n"
+        "  %.4f\u00b0 to %.4f\u00b0 E\n\n"
+        "This may take a while for large PBF files.",
+        pbfFn.GetFullName(),
+        bbox.latMin, bbox.latMax, bbox.lonMin, bbox.lonMax);
+    if (wxMessageBox(msg, "Enrich from OpenStreetMap",
+                     wxOK | wxCANCEL | wxICON_QUESTION, this) != wxOK)
+        return;
+
+    wxProgressDialog progress(
+        "Enriching from OpenStreetMap",
+        "Starting...",
+        100, this,
+        wxPD_AUTO_HIDE | wxPD_APP_MODAL | wxPD_SMOOTH |
+        wxPD_CAN_ABORT | wxPD_ELAPSED_TIME | wxPD_ESTIMATED_TIME);
+
+    auto progressCb = [&](int pct, const std::string& msg) -> bool {
+        return progress.Update(pct, wxString::FromUTF8(msg));
+    };
+
+    int count = OsmData::ExtractBuildings(pbfPath, bbox, gpkgPath, progressCb);
+
+    if (count < 0) {
+        wxMessageBox("Failed to extract buildings from OSM data.",
+                     "Error", wxICON_ERROR | wxOK, this);
+        return;
+    }
+
+    m_osmBuildingsPath = gpkgPath;
+    SetStatusText(wxString::Format("OSM buildings: %d extracted", count));
 }
 
 void MainFrame::OnExit(wxCommandEvent&)

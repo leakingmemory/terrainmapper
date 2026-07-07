@@ -15,7 +15,8 @@ MapView::MapView(wxWindow* parent, const wxString& title,
                  const std::string& vsiPath,
                  const std::string& ar50Path,
                  const std::string& railwayPath,
-                 const std::string& roadsPath)
+                 const std::string& roadsPath,
+                 const std::string& osmBuildingsPath)
     : wxFrame(parent, wxID_ANY, title, wxDefaultPosition, wxSize(900, 700))
 {
     m_canvas = new wxScrolledCanvas(this, wxID_ANY);
@@ -42,7 +43,10 @@ MapView::MapView(wxWindow* parent, const wxString& title,
         progress.Update(88, "Loading railway data...");
         if (!railwayPath.empty())
             LoadRailway(railwayPath);
-        progress.Update(90, "Rendering...");
+        progress.Update(90, "Loading buildings...");
+        if (!osmBuildingsPath.empty())
+            LoadBuildings(osmBuildingsPath);
+        progress.Update(93, "Rendering...");
         m_bitmap = wxBitmap(RenderElevation());
         m_canvas->SetScrollbars(1, 1, m_rasterW, m_rasterH, 0, 0);
         progress.Update(100);
@@ -459,6 +463,126 @@ bool MapView::LoadRoads(const std::string& roadsPath)
     return m_hasRoads;
 }
 
+bool MapView::LoadBuildings(const std::string& osmBuildingsPath)
+{
+    GDALDataset* ds = static_cast<GDALDataset*>(
+        GDALOpenEx(osmBuildingsPath.c_str(), GDAL_OF_VECTOR | GDAL_OF_READONLY,
+                   nullptr, nullptr, nullptr));
+    if (!ds)
+        return false;
+
+    OGRLayer* layer = ds->GetLayerByName("buildings");
+    if (!layer) {
+        GDALClose(ds);
+        return false;
+    }
+
+    // Set up coordinate transform from WGS84 to tile CRS
+    OGRSpatialReference tileSrs;
+    tileSrs.importFromWkt(m_tileProjectionWkt.c_str());
+    tileSrs.SetAxisMappingStrategy(OAMS_TRADITIONAL_GIS_ORDER);
+
+    const OGRSpatialReference* srcSrs = layer->GetSpatialRef();
+    OGRCoordinateTransformation* toTile = nullptr;
+    if (srcSrs) {
+        OGRSpatialReference src(*srcSrs);
+        src.SetAxisMappingStrategy(OAMS_TRADITIONAL_GIS_ORDER);
+        toTile = OGRCreateCoordinateTransformation(&src, &tileSrs);
+    }
+
+    // Spatial filter: transform tile extent to building CRS
+    if (toTile && srcSrs) {
+        OGRSpatialReference src(*srcSrs);
+        src.SetAxisMappingStrategy(OAMS_TRADITIONAL_GIS_ORDER);
+        OGRCoordinateTransformation* fromTile =
+            OGRCreateCoordinateTransformation(&tileSrs, &src);
+        if (fromTile) {
+            double x1 = m_gt[0], y1 = m_gt[3] + m_rasterH * m_gt[5];
+            double x2 = m_gt[0] + m_rasterW * m_gt[1], y2 = m_gt[3];
+            fromTile->Transform(1, &x1, &y1);
+            fromTile->Transform(1, &x2, &y2);
+            layer->SetSpatialFilterRect(
+                std::min(x1, x2), std::min(y1, y2),
+                std::max(x1, x2), std::max(y1, y2));
+            OCTDestroyCoordinateTransformation(fromTile);
+        }
+    }
+
+    auto clamp = [](double v) -> int {
+        constexpr double kMax = 100000.0;
+        return static_cast<int>(std::clamp(v, -kMax, kMax));
+    };
+
+    auto ringToPixels = [&](OGRLinearRing* ring) -> std::vector<wxPoint> {
+        std::vector<wxPoint> pts;
+        if (!ring) return pts;
+        int n = ring->getNumPoints();
+        pts.reserve(n);
+        for (int i = 0; i < n; i++) {
+            double x = ring->getX(i);
+            double y = ring->getY(i);
+            int px = clamp(m_invGt[0] + x * m_invGt[1] + y * m_invGt[2]);
+            int py = clamp(m_invGt[3] + x * m_invGt[4] + y * m_invGt[5]);
+            pts.push_back({px, py});
+        }
+        return pts;
+    };
+
+    layer->ResetReading();
+    OGRFeature* feat;
+    while ((feat = layer->GetNextFeature()) != nullptr) {
+        OGRGeometry* geom = feat->GetGeometryRef();
+        if (!geom) {
+            OGRFeature::DestroyFeature(feat);
+            continue;
+        }
+
+        // Transform entire geometry to tile CRS at once
+        OGRGeometry* transformed = geom->clone();
+        if (toTile)
+            transformed->transform(toTile);
+
+        auto processPolygon = [&](OGRPolygon* poly) {
+            BuildingOutline bldg;
+            bldg.rings.push_back(ringToPixels(poly->getExteriorRing()));
+            for (int h = 0; h < poly->getNumInteriorRings(); h++)
+                bldg.rings.push_back(ringToPixels(poly->getInteriorRing(h)));
+
+            const char* type = feat->GetFieldAsString("building");
+            if (type && type[0]) bldg.type = type;
+
+            const char* name = feat->GetFieldAsString("name");
+            if (name && name[0]) bldg.name = name;
+
+            int levelsIdx = feat->GetFieldIndex("levels");
+            if (levelsIdx >= 0 && feat->IsFieldSetAndNotNull(levelsIdx))
+                bldg.levels = feat->GetFieldAsInteger(levelsIdx);
+
+            if (!bldg.rings.empty() && bldg.rings[0].size() >= 3)
+                m_buildings.push_back(std::move(bldg));
+        };
+
+        OGRwkbGeometryType gtype = wkbFlatten(transformed->getGeometryType());
+        if (gtype == wkbPolygon) {
+            processPolygon(static_cast<OGRPolygon*>(transformed));
+        } else if (gtype == wkbMultiPolygon) {
+            OGRMultiPolygon* mp = static_cast<OGRMultiPolygon*>(transformed);
+            for (int g = 0; g < mp->getNumGeometries(); g++)
+                processPolygon(static_cast<OGRPolygon*>(mp->getGeometryRef(g)));
+        }
+
+        delete transformed;
+        OGRFeature::DestroyFeature(feat);
+    }
+
+    if (toTile)
+        OCTDestroyCoordinateTransformation(toTile);
+
+    GDALClose(ds);
+    m_hasBuildings = !m_buildings.empty();
+    return m_hasBuildings;
+}
+
 wxImage MapView::RenderElevation() const
 {
     wxImage img(m_rasterW, m_rasterH);
@@ -600,6 +724,18 @@ void MapView::OnPaint(wxPaintEvent&)
             }
             for (size_t i = 1; i < seg.points.size(); i++)
                 dc.DrawLine(seg.points[i - 1], seg.points[i]);
+        }
+    }
+
+    // Building overlay
+    if (m_hasBuildings) {
+        dc.SetPen(wxPen(wxColour(180, 100, 60), 1));
+        dc.SetBrush(wxBrush(wxColour(200, 160, 130, 128)));
+        for (const auto& bldg : m_buildings) {
+            if (bldg.rings.empty() || bldg.rings[0].size() < 3)
+                continue;
+            dc.DrawPolygon(static_cast<int>(bldg.rings[0].size()),
+                           bldg.rings[0].data());
         }
     }
 

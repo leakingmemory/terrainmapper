@@ -16,6 +16,7 @@ add_executable(terrainmapper
     src/main.cpp
     src/MainFrame.cpp
     src/MapView.cpp
+    src/OsmData.cpp
     src/ProfileData.cpp
     src/ProfileView.cpp
     src/RoadProfileData.cpp

@@ -16,7 +16,8 @@ public:
             const std::string& vsiPath,
             const std::string& ar50Path = "",
             const std::string& railwayPath = "",
-            const std::string& roadsPath = "");
+            const std::string& roadsPath = "",
+            const std::string& osmBuildingsPath = "");
     ~MapView();
 
 private:
@@ -58,6 +59,16 @@ private:
     std::vector<RoadSegment> m_roadSegments;
     bool m_hasRoads = false;
 
+    // Building overlay (from OSM)
+    struct BuildingOutline {
+        std::vector<std::vector<wxPoint>> rings;  // outer ring + holes
+        std::string type;     // building type (house, apartments, etc.)
+        std::string name;
+        int levels = 0;
+    };
+    std::vector<BuildingOutline> m_buildings;
+    bool m_hasBuildings = false;
+
     // Display
     wxScrolledCanvas* m_canvas = nullptr;
     wxBitmap m_bitmap;
@@ -73,6 +84,7 @@ private:
                        wxProgressDialog* progress = nullptr);
     bool LoadRailway(const std::string& railwayPath);
     bool LoadRoads(const std::string& roadsPath);
+    bool LoadBuildings(const std::string& osmBuildingsPath);
     wxImage RenderElevation() const;
 
     void OnPaint(wxPaintEvent& event);
