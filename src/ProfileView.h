@@ -5,6 +5,7 @@
 
 #include <wx/wx.h>
 #include <wx/listctrl.h>
+#include <wx/notebook.h>
 #include <wx/scrolwin.h>
 #include <wx/splitter.h>
 
@@ -48,7 +49,9 @@ private:
     wxButton* m_showBtn = nullptr;
     wxSplitterWindow* m_splitter = nullptr;
     wxScrolledCanvas* m_canvas = nullptr;
+    wxNotebook* m_notebook = nullptr;
     wxListCtrl* m_junctionList = nullptr;
+    wxListCtrl* m_speedList = nullptr;
     wxPanel* m_statsPanel = nullptr;
 
     // Stats labels
@@ -85,9 +88,11 @@ private:
     void OnJunctionActivated(wxListEvent& event);
     void OnPaint(wxPaintEvent& event);
     void OnMouseMove(wxMouseEvent& event);
+    void OnSpeedLimitActivated(wxListEvent& event);
     void UpdateStats();
     void PopulateLineChoice();
     void PopulateJunctionList();
+    void PopulateSpeedLimits();
 
     // Current profile points (shared between modes)
     const std::vector<ProfilePoint>& CurrentPoints() const;
@@ -101,4 +106,12 @@ private:
     double m_kmMin = 0, m_kmMax = 0;
     double m_elevMin = 0, m_elevMax = 0;
     int m_diagramW = 800;
+
+    // Speed limit sections matched from OSM data
+    struct SpeedSection {
+        double startKm, endKm;
+        int speed;          // km/h
+        double x, y;        // EPSG:25833 midpoint (for local map)
+    };
+    std::vector<SpeedSection> m_speedSections;
 };

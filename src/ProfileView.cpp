@@ -1,6 +1,9 @@
 #include "ProfileView.h"
 #include "LocalMapView.h"
 
+#include <gdal_priv.h>
+#include <ogrsf_frmts.h>
+
 #include <wx/dcbuffer.h>
 #include <wx/progdlg.h>
 
@@ -101,16 +104,28 @@ ProfileView::ProfileView(wxWindow* parent,
     centerSizer->Add(m_statsPanel, 0, wxEXPAND | wxLEFT, 5);
     topPanel->SetSizer(centerSizer);
 
-    // Bottom panel: junction/intersection list
-    m_junctionList = new wxListCtrl(m_splitter, wxID_ANY,
+    // Bottom panel: tabbed lists (junctions + speed limits)
+    m_notebook = new wxNotebook(m_splitter, wxID_ANY);
+
+    m_junctionList = new wxListCtrl(m_notebook, wxID_ANY,
         wxDefaultPosition, wxDefaultSize,
         wxLC_REPORT | wxLC_SINGLE_SEL);
     m_junctionList->AppendColumn("km", wxLIST_FORMAT_RIGHT, 70);
     m_junctionList->AppendColumn("Elevation", wxLIST_FORMAT_RIGHT, 70);
     m_junctionList->AppendColumn("Type", wxLIST_FORMAT_LEFT, 140);
     m_junctionList->AppendColumn("Description", wxLIST_FORMAT_LEFT, 250);
+    m_notebook->AddPage(m_junctionList, "Junctions");
 
-    m_splitter->SplitHorizontally(topPanel, m_junctionList, -180);
+    m_speedList = new wxListCtrl(m_notebook, wxID_ANY,
+        wxDefaultPosition, wxDefaultSize,
+        wxLC_REPORT | wxLC_SINGLE_SEL);
+    m_speedList->AppendColumn("Start km", wxLIST_FORMAT_RIGHT, 80);
+    m_speedList->AppendColumn("End km", wxLIST_FORMAT_RIGHT, 80);
+    m_speedList->AppendColumn("Speed", wxLIST_FORMAT_RIGHT, 80);
+    m_speedList->AppendColumn("Length", wxLIST_FORMAT_RIGHT, 80);
+    m_notebook->AddPage(m_speedList, "Speed Limits");
+
+    m_splitter->SplitHorizontally(topPanel, m_notebook, -180);
     m_splitter->SetMinimumPaneSize(80);
     mainSizer->Add(m_splitter, 1, wxEXPAND | wxALL, 5);
 
@@ -129,6 +144,8 @@ ProfileView::ProfileView(wxWindow* parent,
     m_canvas->Bind(wxEVT_MOTION, &ProfileView::OnMouseMove, this);
     m_junctionList->Bind(wxEVT_LIST_ITEM_ACTIVATED,
                          &ProfileView::OnJunctionActivated, this);
+    m_speedList->Bind(wxEVT_LIST_ITEM_ACTIVATED,
+                      &ProfileView::OnSpeedLimitActivated, this);
 
     // Build tile index
     wxProgressDialog progress(
@@ -401,6 +418,7 @@ void ProfileView::OnShowProfile(wxCommandEvent&)
 
     UpdateStats();
     PopulateJunctionList();
+    PopulateSpeedLimits();
     m_canvas->Refresh();
 
     const auto& stats = (m_mode == Mode::Railway) ?
@@ -743,6 +761,41 @@ void ProfileView::OnPaint(wxPaintEvent&)
         }
     }
 
+    // --- Speed limit bands along top of diagram ---
+    if (!m_speedSections.empty()) {
+        dc.SetFont(wxFont(7, wxFONTFAMILY_SWISS, wxFONTSTYLE_NORMAL,
+                           wxFONTWEIGHT_BOLD));
+        for (const auto& sec : m_speedSections) {
+            int x1 = KmToX(sec.startKm);
+            int x2 = KmToX(sec.endKm);
+            if (x2 - x1 < 2) continue;
+
+            // Color by speed: green=fast, yellow=medium, red=slow
+            wxColour col;
+            if (sec.speed >= 130)
+                col = wxColour(40, 160, 40);
+            else if (sec.speed >= 100)
+                col = wxColour(80, 180, 40);
+            else if (sec.speed >= 70)
+                col = wxColour(200, 200, 40);
+            else if (sec.speed >= 40)
+                col = wxColour(220, 140, 40);
+            else
+                col = wxColour(200, 60, 40);
+
+            dc.SetPen(*wxTRANSPARENT_PEN);
+            dc.SetBrush(wxBrush(col));
+            dc.DrawRectangle(x1, kMarginTop - 12, x2 - x1, 10);
+
+            // Label if wide enough
+            if (x2 - x1 > 25) {
+                dc.SetTextForeground(*wxBLACK);
+                dc.DrawText(wxString::Format("%d", sec.speed),
+                            (x1 + x2) / 2 - 8, kMarginTop - 12);
+            }
+        }
+    }
+
     // --- Crosshair ---
     if (m_mouseKm >= m_kmMin && m_mouseKm <= m_kmMax) {
         int cx = KmToX(m_mouseKm);
@@ -972,4 +1025,207 @@ void ProfileView::OnJunctionActivated(wxListEvent& event)
                                  m_profileData, m_railwayPath,
                                  m_roadsPath, m_osmDataPath);
     map->Show();
+}
+
+void ProfileView::OnSpeedLimitActivated(wxListEvent& event)
+{
+    if (!m_hasProfile) return;
+
+    long sel = event.GetIndex();
+    if (sel < 0 || sel >= static_cast<long>(m_speedSections.size())) return;
+
+    const auto& sec = m_speedSections[sel];
+    if (sec.x == 0 && sec.y == 0) return;
+
+    wxString title = wxString::Format("%.1f–%.1f km — %d km/h",
+                                      sec.startKm, sec.endKm, sec.speed);
+
+    auto* map = new LocalMapView(nullptr, title, sec.x, sec.y,
+                                 m_profileData, m_railwayPath,
+                                 m_roadsPath, m_osmDataPath);
+    map->Show();
+}
+
+void ProfileView::PopulateSpeedLimits()
+{
+    m_speedList->DeleteAllItems();
+    m_speedSections.clear();
+
+    if (m_osmDataPath.empty() || !m_hasProfile)
+        return;
+
+    const auto& pts = CurrentPoints();
+    if (pts.empty())
+        return;
+
+    // Load OSM tracks with maxspeed and match to profile points
+    GDALDataset* ds = static_cast<GDALDataset*>(
+        GDALOpenEx(m_osmDataPath.c_str(), GDAL_OF_VECTOR | GDAL_OF_READONLY,
+                   nullptr, nullptr, nullptr));
+    if (!ds) return;
+
+    OGRLayer* trackLayer = ds->GetLayerByName("railway_tracks");
+    if (!trackLayer) { GDALClose(ds); return; }
+
+    // Set up coordinate transform: WGS84 → EPSG:25833
+    OGRSpatialReference epsg25833;
+    epsg25833.importFromEPSG(25833);
+    epsg25833.SetAxisMappingStrategy(OAMS_TRADITIONAL_GIS_ORDER);
+
+    OGRSpatialReference wgs84;
+    wgs84.SetWellKnownGeogCS("WGS84");
+    wgs84.SetAxisMappingStrategy(OAMS_TRADITIONAL_GIS_ORDER);
+
+    OGRCoordinateTransformation* ct =
+        OGRCreateCoordinateTransformation(&wgs84, &epsg25833);
+    OGRCoordinateTransformation* inv =
+        OGRCreateCoordinateTransformation(&epsg25833, &wgs84);
+
+    // Compute profile bounding box for spatial filter
+    double pMinX = 1e15, pMinY = 1e15, pMaxX = -1e15, pMaxY = -1e15;
+    for (const auto& pt : pts) {
+        pMinX = std::min(pMinX, pt.x);
+        pMinY = std::min(pMinY, pt.y);
+        pMaxX = std::max(pMaxX, pt.x);
+        pMaxY = std::max(pMaxY, pt.y);
+    }
+    // Add 100m buffer
+    pMinX -= 100; pMinY -= 100; pMaxX += 100; pMaxY += 100;
+
+    if (inv) {
+        double fx1 = pMinX, fy1 = pMinY, fx2 = pMaxX, fy2 = pMaxY;
+        inv->Transform(1, &fx1, &fy1);
+        inv->Transform(1, &fx2, &fy2);
+        trackLayer->SetSpatialFilterRect(
+            std::min(fx1, fx2), std::min(fy1, fy2),
+            std::max(fx1, fx2), std::max(fy1, fy2));
+    }
+
+    // For each profile point, store the best speed limit found
+    constexpr double kMatchRadius = 30.0;  // metres
+    std::vector<int> pointSpeed(pts.size(), -1);  // -1 = unknown
+
+    trackLayer->ResetReading();
+    OGRFeature* feat;
+    while ((feat = trackLayer->GetNextFeature()) != nullptr) {
+        int maxspeedIdx = feat->GetFieldIndex("maxspeed");
+        int speed = 0;
+        if (maxspeedIdx >= 0 && feat->IsFieldSetAndNotNull(maxspeedIdx))
+            speed = feat->GetFieldAsInteger(maxspeedIdx);
+
+        if (speed <= 0) {
+            OGRFeature::DestroyFeature(feat);
+            continue;
+        }
+
+        // Skip non-mainline tracks (yard, siding, crossover, spur)
+        const char* serviceField = feat->GetFieldAsString("service");
+        if (serviceField && serviceField[0]) {
+            OGRFeature::DestroyFeature(feat);
+            continue;
+        }
+
+        OGRGeometry* geom = feat->GetGeometryRef();
+        if (!geom) { OGRFeature::DestroyFeature(feat); continue; }
+
+        OGRGeometry* clone = geom->clone();
+        if (ct) clone->transform(ct);
+
+        // For each vertex of this OSM track, find nearest profile point
+        auto matchLine = [&](OGRLineString* line) {
+            int nPts = line->getNumPoints();
+            for (int p = 0; p < nPts; p++) {
+                double ox = line->getX(p), oy = line->getY(p);
+
+                // Find nearest profile point
+                double bestDist2 = kMatchRadius * kMatchRadius;
+                size_t bestIdx = SIZE_MAX;
+                for (size_t i = 0; i < pts.size(); i++) {
+                    double dx = pts[i].x - ox, dy = pts[i].y - oy;
+                    double d2 = dx * dx + dy * dy;
+                    if (d2 < bestDist2) {
+                        bestDist2 = d2;
+                        bestIdx = i;
+                    }
+                }
+
+                if (bestIdx != SIZE_MAX)
+                    pointSpeed[bestIdx] = speed;
+            }
+        };
+
+        OGRwkbGeometryType gtype = wkbFlatten(clone->getGeometryType());
+        if (gtype == wkbLineString)
+            matchLine(static_cast<OGRLineString*>(clone));
+        else if (gtype == wkbMultiLineString) {
+            auto* multi = static_cast<OGRMultiLineString*>(clone);
+            for (int g = 0; g < multi->getNumGeometries(); g++)
+                matchLine(static_cast<OGRLineString*>(multi->getGeometryRef(g)));
+        }
+
+        delete clone;
+        OGRFeature::DestroyFeature(feat);
+    }
+
+    if (inv) OCTDestroyCoordinateTransformation(inv);
+    if (ct) OCTDestroyCoordinateTransformation(ct);
+    GDALClose(ds);
+
+    // Consolidate into speed sections
+    size_t i = 0;
+    while (i < pts.size()) {
+        // Skip points with no speed data
+        if (pointSpeed[i] < 0) { i++; continue; }
+
+        int speed = pointSpeed[i];
+        size_t start = i;
+
+        // Extend while same speed (allow small gaps of up to 5 unknown points)
+        while (i < pts.size()) {
+            if (pointSpeed[i] == speed) {
+                i++;
+            } else if (pointSpeed[i] < 0) {
+                // Look ahead for same speed within 5 points
+                size_t lookahead = i;
+                while (lookahead < pts.size() && lookahead - i < 5
+                       && pointSpeed[lookahead] < 0)
+                    lookahead++;
+                if (lookahead < pts.size() && pointSpeed[lookahead] == speed) {
+                    // Fill the gap
+                    for (size_t j = i; j < lookahead; j++)
+                        pointSpeed[j] = speed;
+                    i = lookahead + 1;
+                } else {
+                    break;
+                }
+            } else {
+                break;
+            }
+        }
+
+        size_t end = i - 1;
+        if (end > start) {
+            size_t mid = (start + end) / 2;
+            SpeedSection sec;
+            sec.startKm = pts[start].km;
+            sec.endKm = pts[end].km;
+            sec.speed = speed;
+            sec.x = pts[mid].x;
+            sec.y = pts[mid].y;
+            m_speedSections.push_back(sec);
+        }
+    }
+
+    // Populate list
+    for (const auto& sec : m_speedSections) {
+        long idx = m_speedList->InsertItem(
+            m_speedList->GetItemCount(),
+            wxString::Format("%.1f", sec.startKm));
+        m_speedList->SetItem(idx, 1,
+            wxString::Format("%.1f", sec.endKm));
+        m_speedList->SetItem(idx, 2,
+            wxString::Format("%d km/h", sec.speed));
+        m_speedList->SetItem(idx, 3,
+            wxString::Format("%.1f km", sec.endKm - sec.startKm));
+    }
 }
