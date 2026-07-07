@@ -306,12 +306,12 @@ static int ExtractRailwayTracks(GDALDataset* src, GDALDataset* dst,
     return count;
 }
 
-static int ExtractRailwayPlatforms(GDALDataset* src, GDALDataset* dst,
-                                    const OsmData::BBox& bbox)
+// Helper: ensure the railway_platforms layer exists in dst, creating it if needed
+static OGRLayer* EnsurePlatformLayer(GDALDataset* dst)
 {
-    // Platforms can be in multipolygons (areas) or lines
-    OGRLayer* polyLayer = src->GetLayerByName("multipolygons");
-    OGRLayer* lineLayer = src->GetLayerByName("lines");
+    OGRLayer* existing = dst->GetLayerByName("railway_platforms");
+    if (existing)
+        return existing;
 
     OGRSpatialReference wgs84;
     wgs84.SetWellKnownGeogCS("WGS84");
@@ -320,7 +320,7 @@ static int ExtractRailwayPlatforms(GDALDataset* src, GDALDataset* dst,
     OGRLayer* dstLayer = dst->CreateLayer("railway_platforms", &wgs84,
                                            wkbGeometryCollection, nullptr);
     if (!dstLayer)
-        return 0;
+        return nullptr;
 
     auto addStr = [&](const char* name, int w) {
         OGRFieldDefn f(name, OFTString); f.SetWidth(w);
@@ -330,74 +330,100 @@ static int ExtractRailwayPlatforms(GDALDataset* src, GDALDataset* dst,
     addStr("osm_id", 20);
     addStr("name", 200);
     addStr("ref", 20);
+    return dstLayer;
+}
+
+// Extract polygon platforms from multipolygons layer (separate dataset open)
+static int ExtractRailwayPlatformPolygons(GDALDataset* src, GDALDataset* dst,
+                                           const OsmData::BBox& bbox)
+{
+    OGRLayer* polyLayer = src->GetLayerByName("multipolygons");
+    if (!polyLayer)
+        return 0;
+
+    OGRLayer* dstLayer = EnsurePlatformLayer(dst);
+    if (!dstLayer)
+        return 0;
+
+    polyLayer->SetSpatialFilterRect(bbox.lonMin, bbox.latMin,
+                                    bbox.lonMax, bbox.latMax);
+    polyLayer->SetAttributeFilter(
+        "other_tags LIKE '%\"railway\"=>\"platform\"%' OR "
+        "other_tags LIKE '%\"railway\"=>\"platform_edge\"%'");
+    polyLayer->ResetReading();
 
     (void)dstLayer->StartTransaction();
-
     int count = 0;
 
-    // Polygon platforms (areas)
-    if (polyLayer) {
-        polyLayer->SetSpatialFilterRect(bbox.lonMin, bbox.latMin,
-                                        bbox.lonMax, bbox.latMax);
-        polyLayer->SetAttributeFilter(
-            "other_tags LIKE '%\"railway\"=>\"platform\"%' OR "
-            "other_tags LIKE '%\"railway\"=>\"platform_edge\"%'");
-        polyLayer->ResetReading();
+    OGRFeature* feat;
+    while ((feat = polyLayer->GetNextFeature()) != nullptr) {
+        OGRFeature* out = OGRFeature::CreateFeature(dstLayer->GetLayerDefn());
+        out->SetGeometry(feat->GetGeometryRef());
 
-        OGRFeature* feat;
-        while ((feat = polyLayer->GetNextFeature()) != nullptr) {
-            OGRFeature* out = OGRFeature::CreateFeature(dstLayer->GetLayerDefn());
-            out->SetGeometry(feat->GetGeometryRef());
+        const char* osmId = feat->GetFieldAsString("osm_id");
+        if (osmId) out->SetField("osm_id", osmId);
 
-            const char* osmId = feat->GetFieldAsString("osm_id");
-            if (osmId) out->SetField("osm_id", osmId);
+        const char* name = feat->GetFieldAsString("name");
+        if (name && name[0]) out->SetField("name", name);
 
-            const char* name = feat->GetFieldAsString("name");
-            if (name && name[0]) out->SetField("name", name);
-
-            const char* otherTags = feat->GetFieldAsString("other_tags");
-            if (otherTags) {
-                std::string ref = OsmData::GetOtherTag(otherTags, "ref");
-                if (!ref.empty()) out->SetField("ref", ref.c_str());
-            }
-
-            (void)dstLayer->CreateFeature(out);
-            OGRFeature::DestroyFeature(out);
-            OGRFeature::DestroyFeature(feat);
-            count++;
+        const char* otherTags = feat->GetFieldAsString("other_tags");
+        if (otherTags) {
+            std::string ref = OsmData::GetOtherTag(otherTags, "ref");
+            if (!ref.empty()) out->SetField("ref", ref.c_str());
         }
+
+        (void)dstLayer->CreateFeature(out);
+        OGRFeature::DestroyFeature(out);
+        OGRFeature::DestroyFeature(feat);
+        count++;
     }
 
-    // Line platforms (edges)
-    if (lineLayer) {
-        lineLayer->SetSpatialFilterRect(bbox.lonMin, bbox.latMin,
-                                        bbox.lonMax, bbox.latMax);
-        lineLayer->SetAttributeFilter(
-            "railway = 'platform' OR railway = 'platform_edge'");
-        lineLayer->ResetReading();
+    (void)dstLayer->CommitTransaction();
+    return count;
+}
 
-        OGRFeature* feat;
-        while ((feat = lineLayer->GetNextFeature()) != nullptr) {
-            OGRFeature* out = OGRFeature::CreateFeature(dstLayer->GetLayerDefn());
-            out->SetGeometry(feat->GetGeometryRef());
+// Extract line platforms from lines layer (separate dataset open)
+static int ExtractRailwayPlatformLines(GDALDataset* src, GDALDataset* dst,
+                                        const OsmData::BBox& bbox)
+{
+    OGRLayer* lineLayer = src->GetLayerByName("lines");
+    if (!lineLayer)
+        return 0;
 
-            const char* osmId = feat->GetFieldAsString("osm_id");
-            if (osmId) out->SetField("osm_id", osmId);
+    OGRLayer* dstLayer = EnsurePlatformLayer(dst);
+    if (!dstLayer)
+        return 0;
 
-            const char* name = feat->GetFieldAsString("name");
-            if (name && name[0]) out->SetField("name", name);
+    lineLayer->SetSpatialFilterRect(bbox.lonMin, bbox.latMin,
+                                    bbox.lonMax, bbox.latMax);
+    lineLayer->SetAttributeFilter(
+        "railway = 'platform' OR railway = 'platform_edge'");
+    lineLayer->ResetReading();
 
-            const char* otherTags = feat->GetFieldAsString("other_tags");
-            if (otherTags) {
-                std::string ref = OsmData::GetOtherTag(otherTags, "ref");
-                if (!ref.empty()) out->SetField("ref", ref.c_str());
-            }
+    (void)dstLayer->StartTransaction();
+    int count = 0;
 
-            (void)dstLayer->CreateFeature(out);
-            OGRFeature::DestroyFeature(out);
-            OGRFeature::DestroyFeature(feat);
-            count++;
+    OGRFeature* feat;
+    while ((feat = lineLayer->GetNextFeature()) != nullptr) {
+        OGRFeature* out = OGRFeature::CreateFeature(dstLayer->GetLayerDefn());
+        out->SetGeometry(feat->GetGeometryRef());
+
+        const char* osmId = feat->GetFieldAsString("osm_id");
+        if (osmId) out->SetField("osm_id", osmId);
+
+        const char* name = feat->GetFieldAsString("name");
+        if (name && name[0]) out->SetField("name", name);
+
+        const char* otherTags = feat->GetFieldAsString("other_tags");
+        if (otherTags) {
+            std::string ref = OsmData::GetOtherTag(otherTags, "ref");
+            if (!ref.empty()) out->SetField("ref", ref.c_str());
         }
+
+        (void)dstLayer->CreateFeature(out);
+        OGRFeature::DestroyFeature(out);
+        OGRFeature::DestroyFeature(feat);
+        count++;
     }
 
     (void)dstLayer->CommitTransaction();
@@ -496,7 +522,7 @@ int OsmData::Extract(const std::string& osmPbfPath,
         return -1;
 
     // Step 2: Open with GDAL
-    CPLSetConfigOption("OGR_INTERLEAVED_READING", "YES");
+    CPLSetConfigOption("OGR_INTERLEAVED_READING", "NO");
     CPLSetConfigOption("OSM_MAX_TMPFILE_SIZE", "1024");
 
     GDALDataset* src = static_cast<GDALDataset*>(
@@ -528,9 +554,8 @@ int OsmData::Extract(const std::string& osmPbfPath,
     }
 
     // Step 4: Extract each data type.
-    // Note: GDAL's OSM driver requires interleaved reading — each layer
-    // can only be read once per dataset open. For multiple layers we need
-    // to reopen the dataset for each pass.
+    // Note: GDAL's OSM driver is single-pass — each layer can only be
+    // read once per dataset open. We reopen the dataset for each pass.
 
     if (progress && !progress(35, "Extracting buildings..."))
     {
@@ -589,8 +614,26 @@ int OsmData::Extract(const std::string& osmPbfPath,
         GDALClose(src);
     }
 
-    // Reopen for platforms
-    if (progress && !progress(82, "Extracting platforms..."))
+    // Reopen for platform lines
+    if (progress && !progress(80, "Extracting platform lines..."))
+    {
+        GDALClose(dst);
+        if (dataPbf != osmPbfPath)
+            remove(dataPbf.c_str());
+        return -1;
+    }
+
+    int platformCount = 0;
+    src = static_cast<GDALDataset*>(
+        GDALOpenEx(dataPbf.c_str(), GDAL_OF_VECTOR | GDAL_OF_READONLY,
+                   nullptr, nullptr, nullptr));
+    if (src) {
+        platformCount += ExtractRailwayPlatformLines(src, dst, bbox);
+        GDALClose(src);
+    }
+
+    // Reopen for platform polygons (multipolygons layer)
+    if (progress && !progress(88, "Extracting platform polygons..."))
     {
         GDALClose(dst);
         if (dataPbf != osmPbfPath)
@@ -601,9 +644,8 @@ int OsmData::Extract(const std::string& osmPbfPath,
     src = static_cast<GDALDataset*>(
         GDALOpenEx(dataPbf.c_str(), GDAL_OF_VECTOR | GDAL_OF_READONLY,
                    nullptr, nullptr, nullptr));
-    int platformCount = 0;
     if (src) {
-        platformCount = ExtractRailwayPlatforms(src, dst, bbox);
+        platformCount += ExtractRailwayPlatformPolygons(src, dst, bbox);
         GDALClose(src);
     }
 
