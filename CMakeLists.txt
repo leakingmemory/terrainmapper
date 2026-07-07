@@ -59,3 +59,23 @@ add_test(
     COMMAND test_osm_extract "${CMAKE_SOURCE_DIR}/test/data/oslo_central.osm.pbf"
     WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}"
 )
+
+add_executable(test_elevation_filter
+    test/test_elevation_filter.cpp
+    src/ProfileData.cpp
+    test/stubs.cpp
+)
+target_include_directories(test_elevation_filter PRIVATE
+    ${GDAL_INCLUDE_DIRS}
+    ${LIBZIP_INCLUDE_DIRS}
+)
+target_link_libraries(test_elevation_filter PRIVATE
+    ${GDAL_LIBRARIES}
+    ${LIBZIP_LIBRARIES}
+)
+target_compile_options(test_elevation_filter PRIVATE
+    ${GDAL_CFLAGS_OTHER}
+    ${LIBZIP_CFLAGS_OTHER}
+)
+
+add_test(NAME elevation_filter COMMAND test_elevation_filter)

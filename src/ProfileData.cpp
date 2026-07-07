@@ -547,6 +547,17 @@ ProfileResult ProfileData::BuildProfile(const std::string& railwayPath,
     // the smoothed track elevation, not raw DTM surface elevation
     SmoothProfile(result.points);
 
+    // Clamp: smoothing (especially vertical curve reconstruction) can push
+    // surface elevations below the plausible minimum.  Clamp to the
+    // threshold + track bed offset so the diagram never shows track
+    // below the flooding limit.
+    constexpr double kMinTrackElev = kMinPlausibleElev + kTrackBedOffset;
+    for (auto& pt : result.points) {
+        if (pt.elevation > -9000 && pt.medium != 'U'
+            && pt.elevation < kMinTrackElev)
+            pt.elevation = kMinTrackElev;
+    }
+
     report(72, "Interpolating tunnels...");
 
     // --- Tunnel interpolation ---
