@@ -231,6 +231,7 @@ static int ExtractRailwayTracks(GDALDataset* src, GDALDataset* dst,
     addInt("gauge");
     addStr("electrified", 20); // contact_line, rail, yes, no
     addInt("voltage");
+    addStr("frequency", 10);    // e.g. 16.7 (Hz) for AC systems
     addInt("maxspeed");
     addStr("track_ref", 20);   // track number at stations
     addStr("tunnel", 10);
@@ -288,6 +289,7 @@ static int ExtractRailwayTracks(GDALDataset* src, GDALDataset* dst,
             tagToIntField("gauge", "gauge");
             tagToField("electrified", "electrified");
             tagToIntField("voltage", "voltage");
+            tagToField("frequency", "frequency");
             tagToIntField("maxspeed", "maxspeed");
             tagToField("railway:track_ref", "track_ref");
             tagToField("tunnel", "tunnel");
