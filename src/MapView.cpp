@@ -1112,7 +1112,7 @@ void MapView::OnMouseMove(wxMouseEvent& event)
         double geoY = m_gt[3] + viewX * m_gt[4] + viewY * m_gt[5];
         double lon = geoX, lat = geoY;
         if (m_toWGS84->Transform(1, &lon, &lat))
-            SetStatusText(wxString::Format("%.4f\u00b0N  %.4f\u00b0E", lat, lon), 2);
+            SetStatusText(wxString::Format(wxString::FromUTF8("%.4f\u00b0N  %.4f\u00b0E"), lat, lon), 2);
     }
 
     // Land cover type

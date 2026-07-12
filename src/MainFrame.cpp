@@ -81,7 +81,7 @@ MainFrame::MainFrame()
 
     // Status bar
     CreateStatusBar();
-    SetStatusText("Ready \u2014 use File > Open ZIP to load an archive");
+    SetStatusText(wxString::FromUTF8("Ready \u2014 use File > Open ZIP to load an archive"));
 }
 
 void MainFrame::OnOpenZip(wxCommandEvent&)
@@ -626,10 +626,10 @@ void MainFrame::LoadZip(const wxString& path)
                 m_list->SetItem(row, 4, wxString::FromUTF8(m[1].str()));
 
             m_list->SetItem(row, 5,
-                wxString::Format("%.2f \u2013 %.2f\u00b0N",
+                wxString::Format(wxString::FromUTF8("%.2f \u2013 %.2f\u00b0N"),
                                  bounds->latMin, bounds->latMax));
             m_list->SetItem(row, 6,
-                wxString::Format("%.2f \u2013 %.2f\u00b0E",
+                wxString::Format(wxString::FromUTF8("%.2f \u2013 %.2f\u00b0E"),
                                  bounds->lonMin, bounds->lonMax));
         }
     }
@@ -653,13 +653,13 @@ void MainFrame::UpdateTitleAndStatus()
 
     if (numZips == 0) {
         SetTitle("TerrainMapper");
-        SetStatusText("Ready \u2014 use File > Open ZIP to load an archive");
+        SetStatusText(wxString::FromUTF8("Ready \u2014 use File > Open ZIP to load an archive"));
     } else if (numZips == 1) {
-        SetTitle(wxString::Format("TerrainMapper \u2014 %s",
+        SetTitle(wxString::Format(wxString::FromUTF8("TerrainMapper \u2014 %s"),
                  wxFileName(m_zipPaths[0]).GetFullName()));
         SetStatusText(wxString::Format("%ld tiles", totalItems));
     } else {
-        SetTitle(wxString::Format("TerrainMapper \u2014 %zu zips, %ld tiles",
+        SetTitle(wxString::Format(wxString::FromUTF8("TerrainMapper \u2014 %zu zips, %ld tiles"),
                                   numZips, totalItems));
         SetStatusText(wxString::Format("%zu archives loaded, %ld tiles total",
                                        numZips, totalItems));
@@ -923,11 +923,12 @@ void MainFrame::OnEnrichOsm(wxCommandEvent&)
 
     // Show bbox to user for confirmation
     wxString msg = wxString::Format(
-        "Extract OSM data (buildings, railway detail) from:\n%s\n\n"
-        "Tile coverage area:\n"
-        "  %.4f\u00b0 to %.4f\u00b0 N\n"
-        "  %.4f\u00b0 to %.4f\u00b0 E\n\n"
-        "This may take a while for large PBF files.",
+        wxString::FromUTF8(
+            "Extract OSM data (buildings, railway detail) from:\n%s\n\n"
+            "Tile coverage area:\n"
+            "  %.4f\u00b0 to %.4f\u00b0 N\n"
+            "  %.4f\u00b0 to %.4f\u00b0 E\n\n"
+            "This may take a while for large PBF files."),
         pbfFn.GetFullName(),
         bbox.latMin, bbox.latMax, bbox.lonMin, bbox.lonMax);
     if (wxMessageBox(msg, "Enrich from OpenStreetMap",
