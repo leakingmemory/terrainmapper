@@ -2,8 +2,12 @@ cmake_minimum_required(VERSION 3.20)
 project(terrainmapper CXX)
 set(CMAKE_CXX_STANDARD 26)
 
-# wxWidgets — non-standard install path on FreeBSD
-set(wxWidgets_CONFIG_EXECUTABLE /usr/local/bin/wxgtk3u-3.2-config)
+# wxWidgets — prefer wx-config on PATH (Linux); fall back to the FreeBSD path.
+find_program(WX_CONFIG NAMES wx-config wxgtk3u-3.2-config
+             PATHS /usr/local/bin)
+if(WX_CONFIG)
+    set(wxWidgets_CONFIG_EXECUTABLE ${WX_CONFIG})
+endif()
 find_package(wxWidgets REQUIRED COMPONENTS core base)
 include(${wxWidgets_USE_FILE})
 

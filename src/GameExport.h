@@ -68,10 +68,12 @@ public:
                const std::string& roadsPath,
                const std::string& osmDataPath,
                const std::vector<std::string>& zipPaths,
+               const std::string& ar50Path = "",
                ProgressCb progress = nullptr);
 
 private:
     ProfileData m_profileData;
+    std::string m_ar50Path;   // AR50 land-cover .gdb path ("" = none)
     std::vector<ExportTrack> m_tracks;
     std::vector<ExportRoad> m_roads;
     std::vector<ExportStation> m_stations;

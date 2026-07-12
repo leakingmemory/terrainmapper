@@ -17,6 +17,7 @@ All binary files use **little-endian** byte order.
     0/                        ← LOD level
       123_456/                ← col_row
         terrain.hm32
+        landcover.u8            ← optional (present if AR50 was loaded)
         tracks.bin
         roads.bin
         meta.json
@@ -77,6 +78,31 @@ fread(heightmap, sizeof(float), 256 * 256, f);
 fclose(f);
 /* heightmap[row][col], row 0 = north */
 ```
+
+## landcover.u8
+
+Optional per-tile land-cover raster. Present only when an AR50 land-cover
+dataset was loaded before exporting; older/plain exports omit the file, and
+consumers should treat a missing file as "no land-cover data".
+
+Raw 256 × 256 array of **uint8** values (65,536 bytes), on the **same grid as
+`terrain.hm32`** (row-major, row 0 = north, pixel centres). Each byte is a
+Norwegian **AR50 `artype`** land-cover code:
+
+| Code | Class        |
+|------|--------------|
+| 0    | Unclassified / no data (outside AR50 coverage) |
+| 10   | Built-up     |
+| 20   | Agriculture  |
+| 30   | Forest       |
+| 50   | Open land    |
+| 60   | Bog / wetland|
+| 70   | Glacier      |
+| 80   | Freshwater   |
+| 81   | Sea          |
+
+Rasterised from the AR50 polygons (EPSG:4258) into each tile's grid, so the
+resolution follows the tile's LOD (10 m at LOD 0 … 80 m at LOD 3).
 
 ## tracks.bin
 

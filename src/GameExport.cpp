@@ -2,6 +2,7 @@
 #include "MainFrame.h"
 
 #include <gdal_priv.h>
+#include <gdal_alg.h>
 #include <ogrsf_frmts.h>
 
 #include <algorithm>
@@ -14,6 +15,79 @@
 #include <sstream>
 
 namespace fs = std::filesystem;
+
+namespace {
+
+// Rasterize the AR50 land-cover layer (EPSG:4258, "artype" attribute) into a
+// 256x256 uint8 tile matching the export heightmap grid (row 0 = north).
+// `out` gets one AR50 artype code per pixel; 0 means unclassified / no polygon.
+// Returns false on failure (callers then skip writing landcover for the tile).
+bool RasterizeTileLandCover(OGRLayer* layer, const char* wkt25833,
+                            OGRCoordinateTransformation* to4258,
+                            const ExportTile& tile,
+                            std::vector<uint8_t>& out)
+{
+    constexpr int N = 256;
+
+    // North-up geotransform: top-left origin, +res east, -res south.
+    double gt[6] = {tile.originX, tile.resolution, 0.0,
+                    tile.originY + tile.extent, 0.0, -tile.resolution};
+
+    GDALDriver* memDrv = GetGDALDriverManager()->GetDriverByName("MEM");
+    if (!memDrv) return false;
+    GDALDataset* memDs = memDrv->Create("", N, N, 1, GDT_Int32, nullptr);
+    if (!memDs) return false;
+    memDs->SetGeoTransform(gt);
+    memDs->SetProjection(wkt25833);
+    memDs->GetRasterBand(1)->Fill(0);
+
+    // Spatial-filter AR50 to this tile's footprint (in the layer CRS) for speed.
+    double xs[4] = {tile.originX, tile.originX + tile.extent,
+                    tile.originX, tile.originX + tile.extent};
+    double ys[4] = {tile.originY, tile.originY,
+                    tile.originY + tile.extent, tile.originY + tile.extent};
+    if (to4258) to4258->Transform(4, xs, ys);
+    double minX = xs[0], maxX = xs[0], minY = ys[0], maxY = ys[0];
+    for (int i = 1; i < 4; ++i) {
+        minX = std::min(minX, xs[i]); maxX = std::max(maxX, xs[i]);
+        minY = std::min(minY, ys[i]); maxY = std::max(maxY, ys[i]);
+    }
+    layer->SetSpatialFilterRect(minX, minY, maxX, maxY);
+
+    const char* transOpts[] = {"DST_SRS=EPSG:4258", nullptr};
+    void* hT = GDALCreateGenImgProjTransformer2(
+        static_cast<GDALDatasetH>(memDs), nullptr,
+        const_cast<char**>(transOpts));
+
+    bool ok = false;
+    if (hT) {
+        int bands[] = {1};
+        OGRLayerH layers[] = {static_cast<OGRLayerH>(layer)};
+        char attr[] = "ATTRIBUTE=artype";
+        char* ropts[] = {attr, nullptr};
+        GDALRasterizeLayers(static_cast<GDALDatasetH>(memDs), 1, bands, 1,
+                            layers, GDALGenImgProjTransform, hT, nullptr,
+                            ropts, nullptr, nullptr);
+        GDALDestroyGenImgProjTransformer(hT);
+
+        std::vector<int32_t> lc(static_cast<size_t>(N) * N, 0);
+        if (memDs->GetRasterBand(1)->RasterIO(GF_Read, 0, 0, N, N, lc.data(),
+                                              N, N, GDT_Int32, 0, 0) == CE_None) {
+            out.resize(static_cast<size_t>(N) * N);
+            for (size_t i = 0; i < lc.size(); ++i) {
+                const int32_t v = lc[i];
+                out[i] = (v < 0 || v > 255) ? 0 : static_cast<uint8_t>(v);
+            }
+            ok = true;
+        }
+    }
+
+    layer->SetSpatialFilter(nullptr);
+    GDALClose(memDs);
+    return ok;
+}
+
+} // namespace
 
 // ─── LOD definitions ───────────────────────────────────────────────
 
@@ -537,6 +611,34 @@ bool GameExporter::WriteTerrainTiles(const std::string& outputDir,
     int total = static_cast<int>(m_tiles.size());
     int done = 0;
 
+    // Optional: open the AR50 land-cover dataset once for per-tile rasterisation.
+    GDALDataset* ar50 = nullptr;
+    OGRLayer* lcLayer = nullptr;
+    OGRCoordinateTransformation* to4258 = nullptr;
+    std::string wkt25833;
+    if (!m_ar50Path.empty()) {
+        ar50 = static_cast<GDALDataset*>(GDALOpenEx(
+            m_ar50Path.c_str(), GDAL_OF_VECTOR | GDAL_OF_READONLY,
+            nullptr, nullptr, nullptr));
+        if (ar50) {
+            lcLayer = ar50->GetLayerByName("ar50");
+            OGRSpatialReference srs25833;
+            srs25833.importFromEPSG(25833);
+            srs25833.SetAxisMappingStrategy(OAMS_TRADITIONAL_GIS_ORDER);
+            char* w = nullptr;
+            if (srs25833.exportToWkt(&w) == OGRERR_NONE && w) {
+                wkt25833 = w;
+                CPLFree(w);
+            }
+            OGRSpatialReference srs4258;
+            srs4258.importFromEPSG(4258);
+            srs4258.SetAxisMappingStrategy(OAMS_TRADITIONAL_GIS_ORDER);
+            to4258 = OGRCreateCoordinateTransformation(&srs25833, &srs4258);
+        }
+        if (!lcLayer)
+            report(50, "AR50 land cover unavailable; skipping landcover.u8");
+    }
+
     for (auto& tile : m_tiles) {
         // Create tile directory
         std::string tileDir = outputDir + "/tiles/" +
@@ -609,6 +711,18 @@ bool GameExporter::WriteTerrainTiles(const std::string& outputDir,
                   heightmap.size() * sizeof(float));
         out.close();
 
+        // Optional per-tile land cover (AR50 artype), same grid as heightmap.
+        if (lcLayer) {
+            std::vector<uint8_t> landcover;
+            if (RasterizeTileLandCover(lcLayer, wkt25833.c_str(), to4258,
+                                       tile, landcover)) {
+                std::string lcPath = tileDir + "/landcover.u8";
+                std::ofstream lcOut(lcPath, std::ios::binary);
+                lcOut.write(reinterpret_cast<const char*>(landcover.data()),
+                            landcover.size());
+            }
+        }
+
         done++;
         if (done % 100 == 0 || done == total) {
             int pct = 50 + 35 * done / total;
@@ -616,6 +730,9 @@ bool GameExporter::WriteTerrainTiles(const std::string& outputDir,
                    std::to_string(total) + " tiles)");
         }
     }
+
+    if (to4258) OCTDestroyCoordinateTransformation(to4258);
+    if (ar50) GDALClose(ar50);
 
     return true;
 }
@@ -951,8 +1068,11 @@ bool GameExporter::Export(const std::string& outputDir,
                            const std::string& roadsPath,
                            const std::string& osmDataPath,
                            const std::vector<std::string>& zipPaths,
+                           const std::string& ar50Path,
                            ProgressCb progress)
 {
+    m_ar50Path = ar50Path;
+
     auto report = [&](int pct, const std::string& msg) -> bool {
         return !progress || progress(pct, msg);
     };

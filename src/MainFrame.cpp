@@ -15,6 +15,7 @@
 #include <ogrsf_frmts.h>
 #include <cpl_vsi.h>
 
+#include <algorithm>
 #include <ctime>
 #include <functional>
 #include <regex>
@@ -54,7 +55,7 @@ MainFrame::MainFrame()
     fileMenu->Append(ID_LoadTransport, "Load &Transport Data...", "Load railway network (.gdb in .zip)");
     fileMenu->Append(ID_RailwayProfile, "Elevation &Profiles...\tCtrl+P", "Show railway and road elevation profiles");
     fileMenu->Append(ID_GameExport, "Export for &Game Engine...\tCtrl+G", "Export tiled terrain, tracks and roads for game engines");
-    fileMenu->Append(ID_EnrichOsm, "Enrich from &OpenStreetMap...", "Import buildings and railway detail from an OSM PBF file");
+    fileMenu->Append(ID_EnrichOsm, "Enrich from &OpenStreetMap...", "Import buildings and railway detail from an OSM PBF file, or load a cached enrichment GPKG directly");
     fileMenu->Append(ID_CloseAll, "&Close All\tCtrl+W", "Remove all loaded tiles");
     fileMenu->AppendSeparator();
     fileMenu->Append(wxID_EXIT, "E&xit\tAlt+F4");
@@ -830,7 +831,7 @@ void MainFrame::OnGameExport(wxCommandEvent&)
 
     GameExporter exporter;
     bool ok = exporter.Export(outputDir, m_railwayPath, m_roadsPath,
-                              m_osmDataPath, m_zipPaths,
+                              m_osmDataPath, m_zipPaths, m_ar50Path,
                               [&](int pct, const std::string& msg) -> bool {
                                   return prog.Update(std::min(pct, 99), msg);
                               });
@@ -853,14 +854,56 @@ void MainFrame::OnEnrichOsm(wxCommandEvent&)
         return;
     }
 
-    wxFileDialog dlg(this, "Select OpenStreetMap PBF file",
+    wxFileDialog dlg(this, "Select OpenStreetMap PBF file or cached enrichment GPKG",
                      wxEmptyString, wxEmptyString,
-                     "PBF files (*.pbf)|*.pbf|All files (*)|*",
+                     "OSM data (*.pbf;*.gpkg)|*.pbf;*.gpkg|"
+                     "OSM PBF (*.pbf)|*.pbf|"
+                     "OSM enrichment GPKG (*.gpkg)|*.gpkg|"
+                     "All files (*)|*",
                      wxFD_OPEN | wxFD_FILE_MUST_EXIST);
     if (dlg.ShowModal() == wxID_CANCEL)
         return;
 
-    const std::string pbfPath = dlg.GetPath().ToStdString();
+    const std::string selPath = dlg.GetPath().ToStdString();
+
+    // Adopt a pre-built OSM enrichment GPKG (buildings + railway detail) as-is,
+    // validating it carries the railway_tracks layer. Sets m_osmDataPath.
+    auto loadEnrichment = [&](const std::string& path) -> bool {
+        GDALDataset* ds = static_cast<GDALDataset*>(
+            GDALOpenEx(path.c_str(), GDAL_OF_VECTOR | GDAL_OF_READONLY,
+                       nullptr, nullptr, nullptr));
+        if (!ds) return false;
+        auto layerCount = [&](const char* name) -> int {
+            OGRLayer* l = ds->GetLayerByName(name);
+            return l ? static_cast<int>(l->GetFeatureCount()) : -1;
+        };
+        int buildings = layerCount("buildings");
+        int tracks = layerCount("railway_tracks");
+        int points = layerCount("railway_points");
+        int platforms = layerCount("railway_platforms");
+        GDALClose(ds);
+        if (tracks < 0) return false; // missing expected layer → not enrichment
+        m_osmDataPath = path;
+        SetStatusText(wxString::Format(
+            "OSM loaded: %d buildings, %d tracks, %d rail points, %d platforms",
+            std::max(buildings, 0), tracks, std::max(points, 0),
+            std::max(platforms, 0)));
+        return true;
+    };
+
+    // A .gpkg selected directly is treated as a ready-made enrichment file —
+    // no PBF and no re-extraction needed (handy when only the cached result is
+    // available, e.g. the planet PBF is too large to keep around).
+    if (wxFileName(dlg.GetPath()).GetExt().Lower() == "gpkg") {
+        if (loadEnrichment(selPath))
+            return;
+        wxMessageBox("That GPKG is not a valid OSM enrichment file\n"
+                     "(missing the railway_tracks layer).",
+                     "Enrich from OpenStreetMap", wxICON_ERROR | wxOK, this);
+        return;
+    }
+
+    const std::string pbfPath = selPath;
 
     // Compute bounding box from all loaded tiles
     auto bbox = OsmData::ComputeTileBBox(m_tileBounds);
@@ -874,26 +917,9 @@ void MainFrame::OnEnrichOsm(wxCommandEvent&)
         (pbfFn.GetPath() + wxFileName::GetPathSeparator()
          + pbfFn.GetName()).ToStdString() + bboxTag;
 
-    // Check for cached result
-    GDALDataset* cached = static_cast<GDALDataset*>(
-        GDALOpenEx(gpkgPath.c_str(), GDAL_OF_VECTOR | GDAL_OF_READONLY,
-                   nullptr, nullptr, nullptr));
-    if (cached) {
-        auto layerCount = [&](const char* name) -> int {
-            OGRLayer* l = cached->GetLayerByName(name);
-            return l ? static_cast<int>(l->GetFeatureCount()) : 0;
-        };
-        int buildings = layerCount("buildings");
-        int tracks = layerCount("railway_tracks");
-        int points = layerCount("railway_points");
-        int platforms = layerCount("railway_platforms");
-        GDALClose(cached);
-        m_osmDataPath = gpkgPath;
-        SetStatusText(wxString::Format(
-            "OSM cached: %d buildings, %d tracks, %d rail points, %d platforms",
-            buildings, tracks, points, platforms));
+    // Reuse a previously extracted result if present.
+    if (loadEnrichment(gpkgPath))
         return;
-    }
 
     // Show bbox to user for confirmation
     wxString msg = wxString::Format(
