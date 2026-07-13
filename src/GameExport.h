@@ -87,6 +87,25 @@ public:
 private:
     std::vector<RailBBox> m_railBBoxes;
 
+    // Uniform grid indexing rail bboxes by cell, so MinDistToRail only checks
+    // nearby segments instead of all of them (GenerateTileGrid calls it per
+    // grid cell over the whole country). Built by BuildRailIndex().
+    double m_railGridMinX = 0, m_railGridMinY = 0, m_railGridCell = 0;
+    int m_railGridCols = 0, m_railGridRows = 0;
+    std::vector<std::vector<int>> m_railGrid;
+    void BuildRailIndex();
+
+    // Precomputed 2D bounds per track/road, and a uniform grid indexing roads
+    // (millions of segments) by cell — so per-tile clipping is fast instead of
+    // an O(tiles x roads) rescan. Built once by BuildVectorIndex().
+    struct BBox2D { float minX, minY, maxX, maxY; };
+    std::vector<BBox2D> m_trackBBox;  // parallel to m_tracks
+    std::vector<BBox2D> m_roadBBox;   // parallel to m_roads
+    double m_gridMinX = 0, m_gridMinY = 0, m_gridCell = 0;
+    int m_gridCols = 0, m_gridRows = 0;
+    std::vector<std::vector<int>> m_roadGrid; // cell (r*cols+c) -> road indices
+    void BuildVectorIndex();
+
     // Phase 1: collect rail geometry and build spatial index
     bool CollectRailGeometry(const std::string& railwayPath,
                              const std::string& osmDataPath,
@@ -112,9 +131,11 @@ private:
     bool WriteVectorData(const std::string& outputDir,
                          ProgressCb progress);
     // Writes one tile's tracks.bin/roads.bin/meta.json. Reads only immutable
-    // geometry, so it is safe to call concurrently across tiles.
-    void WriteOneVectorTile(const ExportTile& tile,
-                            const std::string& outputDir) const;
+    // geometry + indexes, so it is safe to call concurrently across tiles.
+    // `seenRoads` is a per-thread scratch buffer (size m_roads.size()) used to
+    // de-duplicate road candidates from the grid; `tileId` is its marker value.
+    void WriteOneVectorTile(const ExportTile& tile, const std::string& outputDir,
+                            std::vector<int>& seenRoads, int tileId) const;
 
     // Phase 7: write manifest
     bool WriteManifest(const std::string& outputDir,

@@ -13,6 +13,7 @@
 #include <cstdio>
 #include <cstring>
 #include <functional>
+#include <limits>
 #include <mutex>
 #include <set>
 #include <filesystem>
@@ -148,16 +149,72 @@ const std::vector<LodLevel>& GameExporter::GetLodLevels()
 
 // ─── Distance from point to any rail segment ───────────────────────
 
+void GameExporter::BuildRailIndex()
+{
+    m_railGrid.clear();
+    if (m_railBBoxes.empty()) return;
+    m_railGridCell = 10000.0; // 10 km cells
+    m_railGridMinX = m_boundsMinX;
+    m_railGridMinY = m_boundsMinY;
+    m_railGridCols = std::max(1, static_cast<int>(
+                         std::ceil((m_boundsMaxX - m_boundsMinX) / m_railGridCell)));
+    m_railGridRows = std::max(1, static_cast<int>(
+                         std::ceil((m_boundsMaxY - m_boundsMinY) / m_railGridCell)));
+    m_railGrid.assign(static_cast<size_t>(m_railGridCols) * m_railGridRows, {});
+    auto col = [&](double x) {
+        return std::clamp(static_cast<int>((x - m_railGridMinX) / m_railGridCell),
+                          0, m_railGridCols - 1);
+    };
+    auto row = [&](double y) {
+        return std::clamp(static_cast<int>((y - m_railGridMinY) / m_railGridCell),
+                          0, m_railGridRows - 1);
+    };
+    for (size_t i = 0; i < m_railBBoxes.size(); ++i) {
+        const RailBBox& b = m_railBBoxes[i];
+        int c0 = col(b.minX), c1 = col(b.maxX);
+        int r0 = row(b.minY), r1 = row(b.maxY);
+        for (int r = r0; r <= r1; ++r)
+            for (int c = c0; c <= c1; ++c)
+                m_railGrid[static_cast<size_t>(r) * m_railGridCols + c]
+                    .push_back(static_cast<int>(i));
+    }
+}
+
 double GameExporter::MinDistToRail(double x, double y) const
 {
-    double best = 1e18;
-    for (const auto& bb : m_railBBoxes) {
-        // Distance from point to axis-aligned bbox
+    auto bboxDist = [&](const RailBBox& bb) {
         double dx = std::max({bb.minX - x, 0.0, x - bb.maxX});
         double dy = std::max({bb.minY - y, 0.0, y - bb.maxY});
-        double d = std::sqrt(dx * dx + dy * dy);
-        if (d < best) best = d;
-        if (best == 0) return 0;
+        return std::sqrt(dx * dx + dy * dy);
+    };
+
+    if (m_railGrid.empty()) { // no index: brute force
+        double best = 1e18;
+        for (const auto& bb : m_railBBoxes) {
+            double d = bboxDist(bb);
+            if (d < best) best = d;
+            if (best == 0) return 0;
+        }
+        return best;
+    }
+
+    // Only search cells within the largest LOD distance (~20 km) of the point.
+    const int radius = static_cast<int>(std::ceil(20000.0 / m_railGridCell)) + 1;
+    int qc = std::clamp(static_cast<int>((x - m_railGridMinX) / m_railGridCell),
+                        0, m_railGridCols - 1);
+    int qr = std::clamp(static_cast<int>((y - m_railGridMinY) / m_railGridCell),
+                        0, m_railGridRows - 1);
+    double best = 1e18;
+    for (int r = qr - radius; r <= qr + radius; ++r) {
+        if (r < 0 || r >= m_railGridRows) continue;
+        for (int c = qc - radius; c <= qc + radius; ++c) {
+            if (c < 0 || c >= m_railGridCols) continue;
+            for (int idx : m_railGrid[static_cast<size_t>(r) * m_railGridCols + c]) {
+                double d = bboxDist(m_railBBoxes[idx]);
+                if (d < best) best = d;
+                if (best == 0) return 0;
+            }
+        }
     }
     return best;
 }
@@ -558,6 +615,9 @@ bool GameExporter::GenerateTileGrid(ProgressCb progress)
     };
     report(46, "Generating tile grid...");
 
+    // Spatial index so the per-cell rail-distance queries below are fast.
+    BuildRailIndex();
+
     const auto& lods = GetLodLevels();
 
     // Generate tiles from finest LOD to coarsest.
@@ -841,8 +901,67 @@ static void WriteFloat(std::ofstream& out, float v)
     out.write(reinterpret_cast<const char*>(&v), 4);
 }
 
+void GameExporter::BuildVectorIndex()
+{
+    auto boundsOf = [](const std::vector<float>& xs,
+                       const std::vector<float>& ys) -> BBox2D {
+        BBox2D b{std::numeric_limits<float>::max(),
+                 std::numeric_limits<float>::max(),
+                 -std::numeric_limits<float>::max(),
+                 -std::numeric_limits<float>::max()};
+        for (size_t k = 0; k < xs.size(); ++k) {
+            b.minX = std::min(b.minX, xs[k]);
+            b.maxX = std::max(b.maxX, xs[k]);
+            b.minY = std::min(b.minY, ys[k]);
+            b.maxY = std::max(b.maxY, ys[k]);
+        }
+        return b;
+    };
+    m_trackBBox.resize(m_tracks.size());
+    for (size_t i = 0; i < m_tracks.size(); ++i)
+        m_trackBBox[i] = boundsOf(m_tracks[i].x, m_tracks[i].y);
+    m_roadBBox.resize(m_roads.size());
+    for (size_t i = 0; i < m_roads.size(); ++i)
+        m_roadBBox[i] = boundsOf(m_roads[i].x, m_roads[i].y);
+
+    // Uniform grid over the export bounds indexing roads by cell.
+    m_roadGrid.clear();
+    if (m_roads.empty()) return;
+    m_gridCell = 4096.0;
+    m_gridMinX = m_boundsMinX;
+    m_gridMinY = m_boundsMinY;
+    m_gridCols = std::max(1, static_cast<int>(
+                     std::ceil((m_boundsMaxX - m_boundsMinX) / m_gridCell)));
+    m_gridRows = std::max(1, static_cast<int>(
+                     std::ceil((m_boundsMaxY - m_boundsMinY) / m_gridCell)));
+    m_roadGrid.assign(static_cast<size_t>(m_gridCols) * m_gridRows, {});
+    auto col = [&](double x) {
+        return std::clamp(static_cast<int>((x - m_gridMinX) / m_gridCell), 0,
+                          m_gridCols - 1);
+    };
+    auto row = [&](double y) {
+        return std::clamp(static_cast<int>((y - m_gridMinY) / m_gridCell), 0,
+                          m_gridRows - 1);
+    };
+    for (size_t i = 0; i < m_roadBBox.size(); ++i) {
+        const BBox2D& b = m_roadBBox[i];
+        if (b.minX > b.maxX) continue; // empty geometry
+        int c0 = col(b.minX), c1 = col(b.maxX);
+        int r0 = row(b.minY), r1 = row(b.maxY);
+        for (int r = r0; r <= r1; ++r)
+            for (int c = c0; c <= c1; ++c)
+                m_roadGrid[static_cast<size_t>(r) * m_gridCols + c]
+                    .push_back(static_cast<int>(i));
+    }
+    ExportLog("indexed " + std::to_string(m_roads.size()) + " roads into a " +
+              std::to_string(m_gridCols) + "x" + std::to_string(m_gridRows) +
+              " grid");
+}
+
 void GameExporter::WriteOneVectorTile(const ExportTile& tile,
-                                      const std::string& outputDir) const
+                                      const std::string& outputDir,
+                                      std::vector<int>& seenRoads,
+                                      int tileId) const
 {
         std::string tileDir = outputDir + "/tiles/" +
                               std::to_string(tile.lod) + "/" +
@@ -852,19 +971,13 @@ void GameExporter::WriteOneVectorTile(const ExportTile& tile,
         double tMaxX = tile.originX + tile.extent;
         double tMaxY = tile.originY + tile.extent;
 
-        // Find tracks intersecting this tile
+        // Find tracks intersecting this tile (few thousand; flat bbox scan).
         std::vector<const ExportTrack*> tileTracks;
-        for (const auto& t : m_tracks) {
-            if (t.x.empty()) continue;
-            // Quick bbox check — find min/max of track vertices
-            float txMin = *std::min_element(t.x.begin(), t.x.end());
-            float txMax = *std::max_element(t.x.begin(), t.x.end());
-            float tyMin = *std::min_element(t.y.begin(), t.y.end());
-            float tyMax = *std::max_element(t.y.begin(), t.y.end());
-
-            if (txMin < tMaxX && txMax > tile.originX &&
-                tyMin < tMaxY && tyMax > tile.originY)
-                tileTracks.push_back(&t);
+        for (size_t i = 0; i < m_tracks.size(); i++) {
+            const BBox2D& bb = m_trackBBox[i];
+            if (bb.minX < tMaxX && bb.maxX > tile.originX &&
+                bb.minY < tMaxY && bb.maxY > tile.originY)
+                tileTracks.push_back(&m_tracks[i]);
         }
 
         // Write tracks.bin
@@ -889,18 +1002,32 @@ void GameExporter::WriteOneVectorTile(const ExportTile& tile,
             }
         }
 
-        // Find roads intersecting this tile
+        // Find roads intersecting this tile via the uniform grid (millions of
+        // segments). seenRoads de-duplicates candidates that span several cells.
         std::vector<const ExportRoad*> tileRoads;
-        for (const auto& r : m_roads) {
-            if (r.x.empty()) continue;
-            float rxMin = *std::min_element(r.x.begin(), r.x.end());
-            float rxMax = *std::max_element(r.x.begin(), r.x.end());
-            float ryMin = *std::min_element(r.y.begin(), r.y.end());
-            float ryMax = *std::max_element(r.y.begin(), r.y.end());
-
-            if (rxMin < tMaxX && rxMax > tile.originX &&
-                ryMin < tMaxY && ryMax > tile.originY)
-                tileRoads.push_back(&r);
+        if (!m_roadGrid.empty()) {
+            auto col = [&](double x) {
+                return std::clamp(static_cast<int>((x - m_gridMinX) / m_gridCell),
+                                  0, m_gridCols - 1);
+            };
+            auto row = [&](double y) {
+                return std::clamp(static_cast<int>((y - m_gridMinY) / m_gridCell),
+                                  0, m_gridRows - 1);
+            };
+            int c0 = col(tile.originX), c1 = col(tMaxX);
+            int r0 = row(tile.originY), r1 = row(tMaxY);
+            for (int r = r0; r <= r1; r++) {
+                for (int c = c0; c <= c1; c++) {
+                    for (int idx : m_roadGrid[static_cast<size_t>(r) * m_gridCols + c]) {
+                        if (seenRoads[idx] == tileId) continue;
+                        seenRoads[idx] = tileId;
+                        const BBox2D& bb = m_roadBBox[idx];
+                        if (bb.minX < tMaxX && bb.maxX > tile.originX &&
+                            bb.minY < tMaxY && bb.maxY > tile.originY)
+                            tileRoads.push_back(&m_roads[idx]);
+                    }
+                }
+            }
         }
 
         // Write roads.bin
@@ -990,7 +1117,10 @@ bool GameExporter::WriteVectorData(const std::string& outputDir,
     };
     const int total = static_cast<int>(m_tiles.size());
 
-    // Per-tile writes read only immutable geometry, so run them in parallel.
+    // Precompute track/road bounds + the road grid so per-tile clipping is fast.
+    BuildVectorIndex();
+
+    // Per-tile writes read only immutable geometry + indexes, so run in parallel.
     std::atomic<int> nextTile{0};
     std::atomic<int> done{0};
     std::atomic<bool> cancelled{false};
@@ -1001,11 +1131,12 @@ bool GameExporter::WriteVectorData(const std::string& outputDir,
               std::to_string(nThreads) + " threads");
 
     RunPool(nThreads, [&](int) {
+        std::vector<int> seen(m_roads.size(), -1); // per-thread road dedup markers
         for (;;) {
             if (cancelled.load(std::memory_order_relaxed)) break;
             int i = nextTile.fetch_add(1);
             if (i >= total) break;
-            WriteOneVectorTile(m_tiles[i], outputDir);
+            WriteOneVectorTile(m_tiles[i], outputDir, seen, i);
             int d = done.fetch_add(1) + 1;
             if (d % 64 == 0 || d == total) {
                 std::lock_guard<std::mutex> lk(reportMutex);
@@ -1037,7 +1168,11 @@ static void LoadRoads(const std::string& roadsPath,
                    nullptr, nullptr, nullptr));
     if (!ds) return;
 
-    OGRLayer* layer = ds->GetLayerByName("Veglenke");
+    // OnLoadTransport converts the road network into a GPKG layer named
+    // "roads"; fall back to the raw "Veglenke" GML name, then the first layer.
+    OGRLayer* layer = ds->GetLayerByName("roads");
+    if (!layer) layer = ds->GetLayerByName("Veglenke");
+    if (!layer && ds->GetLayerCount() > 0) layer = ds->GetLayer(0);
     if (!layer) { GDALClose(ds); return; }
 
     layer->SetSpatialFilterRect(boundsMinX, boundsMinY, boundsMaxX, boundsMaxY);
@@ -1222,6 +1357,32 @@ bool GameExporter::Export(const std::string& outputDir,
         return false;
     }
 
+    // Rail bboxes + bounds are final after phase 1. Loading roads and generating
+    // the tile grid depend only on those (not on profiling), so run them —
+    // roads first, then the tile grid — on one background thread while the slow
+    // profiling phases run on this thread. Separate data + GDAL datasets, so no
+    // shared mutable state.
+    std::thread bgThread;
+    std::atomic<bool> bgOk{true};
+    bgThread = std::thread([this, roadsPath, &bgOk] {
+        if (!roadsPath.empty()) {
+            ExportLog("phase 4: loading roads (background)");
+            LoadRoads(roadsPath, m_railBBoxes,
+                      m_boundsMinX, m_boundsMinY, m_boundsMaxX, m_boundsMaxY,
+                      m_roads);
+            ExportLog("loaded " + std::to_string(m_roads.size()) +
+                      " road segments");
+        }
+        ExportLog("phase 5: generating tile grid (background)");
+        bgOk = GenerateTileGrid(nullptr); // fast; progress bar driven by profiling
+        ExportLog("tile grid: " + std::to_string(m_tiles.size()) + " tiles");
+    });
+    // Join the background thread on any exit path (early return / exception).
+    struct BgJoin {
+        std::thread& t;
+        ~BgJoin() { if (t.joinable()) t.join(); }
+    } bgJoin{bgThread};
+
     // Phase 2: profile main lines
     ExportLog("phase 2: profiling main lines");
     if (!ProfileMainLines(railwayPath, roadsPath, progress)) {
@@ -1236,21 +1397,12 @@ bool GameExporter::Export(const std::string& outputDir,
         return false;
     }
 
-    // Phase 4: load roads within bounds
-    ExportLog("phase 4: loading roads");
-    report(45, "Loading roads...");
-    LoadRoads(roadsPath, m_railBBoxes,
-              m_boundsMinX, m_boundsMinY, m_boundsMaxX, m_boundsMaxY,
-              m_roads);
-    ExportLog("loaded " + std::to_string(m_roads.size()) + " road segments");
-
-    // Phase 5: generate tile grid
-    ExportLog("phase 5: generating tile grid");
-    if (!GenerateTileGrid(progress)) {
-        ExportLog("phase 5 failed/cancelled");
+    // Wait for the background roads + tile grid to finish.
+    if (bgThread.joinable()) bgThread.join();
+    if (!bgOk) {
+        ExportLog("tile grid failed");
         return false;
     }
-    ExportLog("tile grid: " + std::to_string(m_tiles.size()) + " tiles");
 
     // Phase 6: write terrain heightmaps (+ land cover)
     ExportLog("phase 6: writing terrain tiles");
