@@ -122,9 +122,11 @@ public:
 private:
     std::vector<TileIndexEntry> m_tileIndex;
 
-    // LRU tile cache (mutable because sampling is logically const)
+    // LRU tile cache (mutable because sampling is logically const).
+    // Each cached DTM cell is a full float raster (~100 MB), so keep few
+    // resident: sampling is spatially coherent, so a small cache still hits.
     mutable std::vector<CachedTile> m_tileCache;
-    static constexpr int kMaxCachedTiles = 8;
+    static constexpr int kMaxCachedTiles = 3;
 
     // Load a tile's raster data into cache, evicting LRU if needed
     const CachedTile* LoadTileIntoCache(int tileIdx) const;
