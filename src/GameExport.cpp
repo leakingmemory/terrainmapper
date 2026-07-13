@@ -3,6 +3,7 @@
 
 #include <gdal_priv.h>
 #include <gdal_alg.h>
+#include <gdal_utils.h>
 #include <ogrsf_frmts.h>
 
 #include <algorithm>
@@ -22,7 +23,8 @@ namespace {
 // 256x256 uint8 tile matching the export heightmap grid (row 0 = north).
 // `out` gets one AR50 artype code per pixel; 0 means unclassified / no polygon.
 // Returns false on failure (callers then skip writing landcover for the tile).
-bool RasterizeTileLandCover(OGRLayer* layer, const char* wkt25833,
+bool RasterizeTileLandCover(GDALDataset* ar50DS, OGRLayer* layer,
+                            const char* wkt25833,
                             OGRCoordinateTransformation* to4258,
                             const ExportTile& tile,
                             std::vector<uint8_t>& out)
@@ -54,33 +56,39 @@ bool RasterizeTileLandCover(OGRLayer* layer, const char* wkt25833,
     }
     layer->SetSpatialFilterRect(minX, minY, maxX, maxY);
 
-    const char* transOpts[] = {"DST_SRS=EPSG:4258", nullptr};
-    void* hT = GDALCreateGenImgProjTransformer2(
-        static_cast<GDALDatasetH>(memDs), nullptr,
-        const_cast<char**>(transOpts));
+    // Use the high-level rasterizer: it reprojects the AR50 polygons
+    // (EPSG:4258, latitude/longitude authority axis order) into the tile's
+    // EPSG:25833 grid correctly. The earlier low-level GDALRasterizeLayers +
+    // GDALCreateGenImgProjTransformer2 path mishandled the source CRS axis
+    // order and burned nothing (every tile came out all-zero).
+    char** argv = nullptr;
+    argv = CSLAddString(argv, "-a");
+    argv = CSLAddString(argv, "artype");
+    argv = CSLAddString(argv, "-l");
+    argv = CSLAddString(argv, layer->GetName());
+    GDALRasterizeOptions* ropts = GDALRasterizeOptionsNew(argv, nullptr);
 
     bool ok = false;
-    if (hT) {
-        int bands[] = {1};
-        OGRLayerH layers[] = {static_cast<OGRLayerH>(layer)};
-        char attr[] = "ATTRIBUTE=artype";
-        char* ropts[] = {attr, nullptr};
-        GDALRasterizeLayers(static_cast<GDALDatasetH>(memDs), 1, bands, 1,
-                            layers, GDALGenImgProjTransform, hT, nullptr,
-                            ropts, nullptr, nullptr);
-        GDALDestroyGenImgProjTransformer(hT);
-
-        std::vector<int32_t> lc(static_cast<size_t>(N) * N, 0);
-        if (memDs->GetRasterBand(1)->RasterIO(GF_Read, 0, 0, N, N, lc.data(),
-                                              N, N, GDT_Int32, 0, 0) == CE_None) {
-            out.resize(static_cast<size_t>(N) * N);
-            for (size_t i = 0; i < lc.size(); ++i) {
-                const int32_t v = lc[i];
-                out[i] = (v < 0 || v > 255) ? 0 : static_cast<uint8_t>(v);
+    if (ropts) {
+        int usageErr = 0;
+        GDALDatasetH res = GDALRasterize(nullptr, GDALDataset::ToHandle(memDs),
+                                         GDALDataset::ToHandle(ar50DS), ropts,
+                                         &usageErr);
+        GDALRasterizeOptionsFree(ropts);
+        if (res) {
+            std::vector<int32_t> lc(static_cast<size_t>(N) * N, 0);
+            if (memDs->GetRasterBand(1)->RasterIO(GF_Read, 0, 0, N, N, lc.data(),
+                                                  N, N, GDT_Int32, 0, 0) == CE_None) {
+                out.resize(static_cast<size_t>(N) * N);
+                for (size_t i = 0; i < lc.size(); ++i) {
+                    const int32_t v = lc[i];
+                    out[i] = (v < 0 || v > 255) ? 0 : static_cast<uint8_t>(v);
+                }
+                ok = true;
             }
-            ok = true;
         }
     }
+    CSLDestroy(argv);
 
     layer->SetSpatialFilter(nullptr);
     GDALClose(memDs);
@@ -714,7 +722,7 @@ bool GameExporter::WriteTerrainTiles(const std::string& outputDir,
         // Optional per-tile land cover (AR50 artype), same grid as heightmap.
         if (lcLayer) {
             std::vector<uint8_t> landcover;
-            if (RasterizeTileLandCover(lcLayer, wkt25833.c_str(), to4258,
+            if (RasterizeTileLandCover(ar50, lcLayer, wkt25833.c_str(), to4258,
                                        tile, landcover)) {
                 std::string lcPath = tileDir + "/landcover.u8";
                 std::ofstream lcOut(lcPath, std::ios::binary);
