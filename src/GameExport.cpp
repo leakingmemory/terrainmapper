@@ -428,7 +428,7 @@ bool GameExporter::ProfileSidings(const std::string& osmDataPath,
         OGRFeature::DestroyFeature(feat);
 
         done++;
-        if (done % 200 == 0 || done == total) {
+        if (done % 8 == 0 || done == total) {
             int pct = 30 + 15 * done / total;
             report(pct, "Profiling sidings... (" + std::to_string(done) + "/" +
                    std::to_string(total) + ")");
@@ -732,7 +732,11 @@ bool GameExporter::WriteTerrainTiles(const std::string& outputDir,
         }
 
         done++;
-        if (done % 100 == 0 || done == total) {
+        // Report every tile: land-cover rasterisation can take ~1 s each, and
+        // the progress callback is what pumps the GUI event loop. Without a
+        // frequent call the window stops answering the Wayland/compositor ping
+        // and GNOME force-quits it (SIGKILL) as "not responding".
+        {
             int pct = 50 + 35 * done / total;
             report(pct, "Writing terrain... (" + std::to_string(done) + "/" +
                    std::to_string(total) + " tiles)");
@@ -910,7 +914,7 @@ bool GameExporter::WriteVectorData(const std::string& outputDir,
         }
 
         done++;
-        if (done % 200 == 0 || done == total) {
+        if (done % 25 == 0 || done == total) {
             int pct = 85 + 8 * done / total;
             report(pct, "Writing vector data... (" + std::to_string(done) + "/" +
                    std::to_string(total) + ")");
