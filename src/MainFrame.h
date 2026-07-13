@@ -5,9 +5,13 @@
 
 #include "OsmData.h"
 
+#include <atomic>
 #include <optional>
 #include <string>
+#include <thread>
 #include <vector>
+
+class wxProgressDialog;
 
 class MainFrame : public wxFrame {
 public:
@@ -43,12 +47,26 @@ private:
     void OnExit(wxCommandEvent& event);
     void OnAbout(wxCommandEvent& event);
     void OnTileActivated(wxListEvent& event);
+    void OnClose(wxCloseEvent& event);
 
     void LoadZip(const wxString& path);
     void UpdateTitleAndStatus();
 
     std::optional<TileBounds> GetTileBounds(const std::string& outerZipPath,
                                             const std::string& entryName);
+
+    // Background Game Export (runs off the UI thread; updates marshaled back
+    // via CallAfter). Inputs are copied so the worker never reads members.
+    void RunExportWorker(std::string outputDir, std::string railwayPath,
+                         std::string roadsPath, std::string osmDataPath,
+                         std::vector<std::string> zipPaths, std::string ar50Path);
+    void OnExportProgress(int pct, const wxString& msg);
+    void OnExportDone(bool ok, bool cancelled, const wxString& outputDir);
+
+    std::thread m_exportThread;
+    std::atomic<bool> m_exportCancel{false};
+    bool m_exportRunning = false;
+    wxProgressDialog* m_exportProgress = nullptr;
 
     wxDECLARE_EVENT_TABLE();
 };

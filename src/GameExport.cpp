@@ -7,17 +7,53 @@
 #include <ogrsf_frmts.h>
 
 #include <algorithm>
+#include <atomic>
+#include <chrono>
 #include <cmath>
 #include <cstdio>
 #include <cstring>
+#include <functional>
+#include <mutex>
 #include <set>
 #include <filesystem>
 #include <fstream>
 #include <sstream>
+#include <thread>
 
 namespace fs = std::filesystem;
 
 namespace {
+
+// Parallel tile-writing tuning. Each worker keeps its own DTM tile cache and
+// AR50 dataset, so memory grows with the thread count — keep both modest.
+constexpr int kMaxExportThreads = 4; // cap regardless of core count
+constexpr int kThreadCacheSize = 2;  // DTM cells resident per worker (~100 MB each)
+
+int ExportThreadCount() {
+    unsigned hw = std::thread::hardware_concurrency();
+    return std::clamp<int>(hw ? static_cast<int>(hw) : 1, 1, kMaxExportThreads);
+}
+
+// Spawn `n` worker threads running body(workerId), then join them all.
+void RunPool(int n, const std::function<void(int)>& body) {
+    std::vector<std::thread> pool;
+    pool.reserve(n);
+    for (int i = 0; i < n; ++i) pool.emplace_back(body, i);
+    for (auto& t : pool) t.join();
+}
+
+// Timestamped stdout log for the export pipeline. Flushed immediately so the
+// last line survives even if the process is killed or crashes mid-phase — this
+// tells you which phase was running. Run terrainmapper from a terminal to see it.
+std::mutex g_logMutex;
+void ExportLog(const std::string& msg) {
+    static const auto start = std::chrono::steady_clock::now();
+    const double t = std::chrono::duration<double>(
+                         std::chrono::steady_clock::now() - start).count();
+    std::lock_guard<std::mutex> lk(g_logMutex);
+    std::printf("[export %8.1fs] %s\n", t, msg.c_str());
+    std::fflush(stdout);
+}
 
 // Rasterize the AR50 land-cover layer (EPSG:4258, "artype" attribute) into a
 // 256x256 uint8 tile matching the export heightmap grid (row 0 = north).
@@ -309,8 +345,9 @@ bool GameExporter::ProfileMainLines(const std::string& railwayPath,
 
         done++;
         int pct = 5 + 25 * done / static_cast<int>(lineNames.size());
-        report(pct, "Profiled " + name + " (" + std::to_string(done) + "/" +
-               std::to_string(lineNames.size()) + ")");
+        if (!report(pct, "Profiled " + name + " (" + std::to_string(done) + "/" +
+                         std::to_string(lineNames.size()) + ")"))
+            return false;
     }
 
     return true;
@@ -430,8 +467,9 @@ bool GameExporter::ProfileSidings(const std::string& osmDataPath,
         done++;
         if (done % 8 == 0 || done == total) {
             int pct = 30 + 15 * done / total;
-            report(pct, "Profiling sidings... (" + std::to_string(done) + "/" +
-                   std::to_string(total) + ")");
+            if (!report(pct, "Profiling sidings... (" + std::to_string(done) +
+                             "/" + std::to_string(total) + ")"))
+                return false;
         }
     }
 
@@ -608,6 +646,84 @@ bool GameExporter::GenerateTileGrid(ProgressCb progress)
 
 // ─── Phase 5: Write terrain heightmaps ─────────────────────────────
 
+// Samples one tile's gap-filled heightmap and optional AR50 land cover, and
+// writes terrain.hm32 (+ landcover.u8). Uses the caller-provided per-thread
+// elevation sampler and AR50 handle, so it is safe to run concurrently.
+static void WriteOneTerrainTile(const ExportTile& tile, ProfileData& sampler,
+                                GDALDataset* ar50, OGRLayer* lcLayer,
+                                const char* wkt25833,
+                                OGRCoordinateTransformation* to4258,
+                                const std::string& outputDir)
+{
+    constexpr int kTilePixels = 256;
+    std::string tileDir = outputDir + "/tiles/" + std::to_string(tile.lod) + "/" +
+                          std::to_string(tile.col) + "_" + std::to_string(tile.row);
+    fs::create_directories(tileDir);
+
+    // Sample heightmap (row 0 = north edge).
+    std::vector<float> heightmap(kTilePixels * kTilePixels, -9999.0f);
+    for (int py = 0; py < kTilePixels; py++) {
+        double y = tile.originY + tile.extent - (py + 0.5) * tile.resolution;
+        for (int px = 0; px < kTilePixels; px++) {
+            double x = tile.originX + (px + 0.5) * tile.resolution;
+            float elev;
+            if (sampler.SampleElevation(x, y, elev))
+                heightmap[py * kTilePixels + px] = elev;
+        }
+    }
+
+    // Fill nodata gaps with iterative nearest-neighbour averaging.
+    bool hasGaps = false;
+    for (float v : heightmap) {
+        if (v < -9000) { hasGaps = true; break; }
+    }
+    if (hasGaps) {
+        std::vector<float> filled = heightmap;
+        for (int iter = 0; iter < 10; iter++) {
+            bool changed = false;
+            for (int py = 0; py < kTilePixels; py++) {
+                for (int px = 0; px < kTilePixels; px++) {
+                    int idx = py * kTilePixels + px;
+                    if (filled[idx] > -9000) continue;
+                    double sum = 0;
+                    int count = 0;
+                    if (px > 0 && filled[idx - 1] > -9000)
+                        { sum += filled[idx - 1]; count++; }
+                    if (px < kTilePixels - 1 && filled[idx + 1] > -9000)
+                        { sum += filled[idx + 1]; count++; }
+                    if (py > 0 && filled[idx - kTilePixels] > -9000)
+                        { sum += filled[idx - kTilePixels]; count++; }
+                    if (py < kTilePixels - 1 && filled[idx + kTilePixels] > -9000)
+                        { sum += filled[idx + kTilePixels]; count++; }
+                    if (count > 0) {
+                        filled[idx] = static_cast<float>(sum / count);
+                        changed = true;
+                    }
+                }
+            }
+            if (!changed) break;
+            heightmap = filled;
+        }
+        heightmap = filled;
+    }
+
+    {
+        std::ofstream out(tileDir + "/terrain.hm32", std::ios::binary);
+        out.write(reinterpret_cast<const char*>(heightmap.data()),
+                  heightmap.size() * sizeof(float));
+    }
+
+    if (lcLayer) {
+        std::vector<uint8_t> landcover;
+        if (RasterizeTileLandCover(ar50, lcLayer, wkt25833, to4258, tile,
+                                   landcover)) {
+            std::ofstream lcOut(tileDir + "/landcover.u8", std::ios::binary);
+            lcOut.write(reinterpret_cast<const char*>(landcover.data()),
+                        landcover.size());
+        }
+    }
+}
+
 bool GameExporter::WriteTerrainTiles(const std::string& outputDir,
                                       ProgressCb progress)
 {
@@ -615,138 +731,97 @@ bool GameExporter::WriteTerrainTiles(const std::string& outputDir,
         return !progress || progress(pct, msg);
     };
 
-    constexpr int kTilePixels = 256;
-    int total = static_cast<int>(m_tiles.size());
-    int done = 0;
+    const int total = static_cast<int>(m_tiles.size());
 
-    // Optional: open the AR50 land-cover dataset once for per-tile rasterisation.
-    GDALDataset* ar50 = nullptr;
-    OGRLayer* lcLayer = nullptr;
-    OGRCoordinateTransformation* to4258 = nullptr;
+    // Probe AR50 once to validate the layer and capture the shared EPSG:25833
+    // WKT. Each worker opens its own dataset + transform below (GDAL dataset
+    // handles and OGRCoordinateTransformation are not safe to share).
     std::string wkt25833;
+    bool useAr50 = false;
     if (!m_ar50Path.empty()) {
-        ar50 = static_cast<GDALDataset*>(GDALOpenEx(
+        GDALDataset* probe = static_cast<GDALDataset*>(GDALOpenEx(
             m_ar50Path.c_str(), GDAL_OF_VECTOR | GDAL_OF_READONLY,
             nullptr, nullptr, nullptr));
-        if (ar50) {
-            lcLayer = ar50->GetLayerByName("ar50");
-            OGRSpatialReference srs25833;
-            srs25833.importFromEPSG(25833);
-            srs25833.SetAxisMappingStrategy(OAMS_TRADITIONAL_GIS_ORDER);
-            char* w = nullptr;
-            if (srs25833.exportToWkt(&w) == OGRERR_NONE && w) {
-                wkt25833 = w;
-                CPLFree(w);
+        if (probe) {
+            if (probe->GetLayerByName("ar50")) {
+                OGRSpatialReference srs;
+                srs.importFromEPSG(25833);
+                srs.SetAxisMappingStrategy(OAMS_TRADITIONAL_GIS_ORDER);
+                char* w = nullptr;
+                if (srs.exportToWkt(&w) == OGRERR_NONE && w) {
+                    wkt25833 = w;
+                    CPLFree(w);
+                }
+                useAr50 = true;
             }
-            OGRSpatialReference srs4258;
-            srs4258.importFromEPSG(4258);
-            srs4258.SetAxisMappingStrategy(OAMS_TRADITIONAL_GIS_ORDER);
-            to4258 = OGRCreateCoordinateTransformation(&srs25833, &srs4258);
+            GDALClose(probe);
         }
-        if (!lcLayer)
+        if (!useAr50)
             report(50, "AR50 land cover unavailable; skipping landcover.u8");
     }
 
-    for (auto& tile : m_tiles) {
-        // Create tile directory
-        std::string tileDir = outputDir + "/tiles/" +
-                              std::to_string(tile.lod) + "/" +
-                              std::to_string(tile.col) + "_" +
-                              std::to_string(tile.row);
-        fs::create_directories(tileDir);
+    // Parallel per-tile writing. Tiles are independent (each writes its own
+    // directory), so workers pull from a shared atomic index. Each worker owns
+    // its elevation sampler and AR50 handle for thread safety.
+    std::atomic<int> nextTile{0};
+    std::atomic<int> done{0};
+    std::atomic<bool> cancelled{false};
+    std::mutex reportMutex;
 
-        // Sample heightmap
-        std::vector<float> heightmap(kTilePixels * kTilePixels, -9999.0f);
+    const int nThreads = ExportThreadCount();
+    ExportLog("terrain: " + std::to_string(total) + " tiles across " +
+              std::to_string(nThreads) + " threads" +
+              (useAr50 ? " (+ land cover)" : ""));
 
-        for (int py = 0; py < kTilePixels; py++) {
-            // Row 0 = north edge (top), row 255 = south edge (bottom)
-            double y = tile.originY + tile.extent - (py + 0.5) * tile.resolution;
+    RunPool(nThreads, [&](int) {
+        ProfileData sampler = m_profileData.forThread(kThreadCacheSize);
 
-            for (int px = 0; px < kTilePixels; px++) {
-                double x = tile.originX + (px + 0.5) * tile.resolution;
-
-                float elev;
-                if (m_profileData.SampleElevation(x, y, elev))
-                    heightmap[py * kTilePixels + px] = elev;
+        GDALDataset* ar50 = nullptr;
+        OGRLayer* lcLayer = nullptr;
+        OGRCoordinateTransformation* to4258 = nullptr;
+        if (useAr50) {
+            ar50 = static_cast<GDALDataset*>(GDALOpenEx(
+                m_ar50Path.c_str(), GDAL_OF_VECTOR | GDAL_OF_READONLY,
+                nullptr, nullptr, nullptr));
+            if (ar50) {
+                lcLayer = ar50->GetLayerByName("ar50");
+                OGRSpatialReference s25833, s4258;
+                s25833.importFromEPSG(25833);
+                s25833.SetAxisMappingStrategy(OAMS_TRADITIONAL_GIS_ORDER);
+                s4258.importFromEPSG(4258);
+                s4258.SetAxisMappingStrategy(OAMS_TRADITIONAL_GIS_ORDER);
+                to4258 = OGRCreateCoordinateTransformation(&s25833, &s4258);
             }
         }
 
-        // Fill nodata gaps with nearest valid neighbor (simple flood fill)
-        // First pass: identify gaps
-        bool hasGaps = false;
-        for (float v : heightmap) {
-            if (v < -9000) { hasGaps = true; break; }
-        }
+        for (;;) {
+            if (cancelled.load(std::memory_order_relaxed)) break;
+            int i = nextTile.fetch_add(1);
+            if (i >= total) break;
 
-        if (hasGaps) {
-            // Simple iterative nearest-neighbor fill
-            std::vector<float> filled = heightmap;
-            for (int iter = 0; iter < 10; iter++) {
-                bool changed = false;
-                for (int py = 0; py < kTilePixels; py++) {
-                    for (int px = 0; px < kTilePixels; px++) {
-                        int idx = py * kTilePixels + px;
-                        if (filled[idx] > -9000) continue;
+            WriteOneTerrainTile(m_tiles[i], sampler, ar50, lcLayer,
+                                wkt25833.c_str(), to4258, outputDir);
 
-                        // Average valid neighbors
-                        double sum = 0;
-                        int count = 0;
-                        if (px > 0 && filled[idx - 1] > -9000)
-                            { sum += filled[idx - 1]; count++; }
-                        if (px < kTilePixels - 1 && filled[idx + 1] > -9000)
-                            { sum += filled[idx + 1]; count++; }
-                        if (py > 0 && filled[idx - kTilePixels] > -9000)
-                            { sum += filled[idx - kTilePixels]; count++; }
-                        if (py < kTilePixels - 1 && filled[idx + kTilePixels] > -9000)
-                            { sum += filled[idx + kTilePixels]; count++; }
-
-                        if (count > 0) {
-                            filled[idx] = static_cast<float>(sum / count);
-                            changed = true;
-                        }
-                    }
-                }
-                if (!changed) break;
-                heightmap = filled;
-            }
-            heightmap = filled;
-        }
-
-        // Write raw float32
-        std::string hmPath = tileDir + "/terrain.hm32";
-        std::ofstream out(hmPath, std::ios::binary);
-        out.write(reinterpret_cast<const char*>(heightmap.data()),
-                  heightmap.size() * sizeof(float));
-        out.close();
-
-        // Optional per-tile land cover (AR50 artype), same grid as heightmap.
-        if (lcLayer) {
-            std::vector<uint8_t> landcover;
-            if (RasterizeTileLandCover(ar50, lcLayer, wkt25833.c_str(), to4258,
-                                       tile, landcover)) {
-                std::string lcPath = tileDir + "/landcover.u8";
-                std::ofstream lcOut(lcPath, std::ios::binary);
-                lcOut.write(reinterpret_cast<const char*>(landcover.data()),
-                            landcover.size());
+            int d = done.fetch_add(1) + 1;
+            if (d % 1000 == 0 || d == total)
+                ExportLog("terrain tiles " + std::to_string(d) + "/" +
+                          std::to_string(total));
+            if (d % 16 == 0 || d == total) {
+                std::lock_guard<std::mutex> lk(reportMutex);
+                int pct = 50 + 35 * d / total;
+                if (!report(pct, "Writing terrain... (" + std::to_string(d) +
+                                     "/" + std::to_string(total) + " tiles)"))
+                    cancelled.store(true, std::memory_order_relaxed);
             }
         }
 
-        done++;
-        // Report every tile: land-cover rasterisation can take ~1 s each, and
-        // the progress callback is what pumps the GUI event loop. Without a
-        // frequent call the window stops answering the Wayland/compositor ping
-        // and GNOME force-quits it (SIGKILL) as "not responding".
-        {
-            int pct = 50 + 35 * done / total;
-            report(pct, "Writing terrain... (" + std::to_string(done) + "/" +
-                   std::to_string(total) + " tiles)");
-        }
-    }
+        if (to4258) OCTDestroyCoordinateTransformation(to4258);
+        if (ar50) GDALClose(ar50);
+    });
 
-    if (to4258) OCTDestroyCoordinateTransformation(to4258);
-    if (ar50) GDALClose(ar50);
-
-    return true;
+    ExportLog("terrain done: " + std::to_string(done.load()) + " tiles" +
+              std::string(cancelled.load() ? " (cancelled)" : ""));
+    return !cancelled.load();
 }
 
 // ─── Phase 6: Write vector data per tile ───────────────────────────
@@ -766,17 +841,9 @@ static void WriteFloat(std::ofstream& out, float v)
     out.write(reinterpret_cast<const char*>(&v), 4);
 }
 
-bool GameExporter::WriteVectorData(const std::string& outputDir,
-                                    ProgressCb progress)
+void GameExporter::WriteOneVectorTile(const ExportTile& tile,
+                                      const std::string& outputDir) const
 {
-    auto report = [&](int pct, const std::string& msg) -> bool {
-        return !progress || progress(pct, msg);
-    };
-
-    int total = static_cast<int>(m_tiles.size());
-    int done = 0;
-
-    for (const auto& tile : m_tiles) {
         std::string tileDir = outputDir + "/tiles/" +
                               std::to_string(tile.lod) + "/" +
                               std::to_string(tile.col) + "_" +
@@ -913,15 +980,46 @@ bool GameExporter::WriteVectorData(const std::string& outputDir,
             out << "}\n";
         }
 
-        done++;
-        if (done % 25 == 0 || done == total) {
-            int pct = 85 + 8 * done / total;
-            report(pct, "Writing vector data... (" + std::to_string(done) + "/" +
-                   std::to_string(total) + ")");
-        }
-    }
+}
 
-    return true;
+bool GameExporter::WriteVectorData(const std::string& outputDir,
+                                    ProgressCb progress)
+{
+    auto report = [&](int pct, const std::string& msg) -> bool {
+        return !progress || progress(pct, msg);
+    };
+    const int total = static_cast<int>(m_tiles.size());
+
+    // Per-tile writes read only immutable geometry, so run them in parallel.
+    std::atomic<int> nextTile{0};
+    std::atomic<int> done{0};
+    std::atomic<bool> cancelled{false};
+    std::mutex reportMutex;
+
+    const int nThreads = ExportThreadCount();
+    ExportLog("vector data: " + std::to_string(total) + " tiles across " +
+              std::to_string(nThreads) + " threads");
+
+    RunPool(nThreads, [&](int) {
+        for (;;) {
+            if (cancelled.load(std::memory_order_relaxed)) break;
+            int i = nextTile.fetch_add(1);
+            if (i >= total) break;
+            WriteOneVectorTile(m_tiles[i], outputDir);
+            int d = done.fetch_add(1) + 1;
+            if (d % 64 == 0 || d == total) {
+                std::lock_guard<std::mutex> lk(reportMutex);
+                int pct = 85 + 8 * d / total;
+                if (!report(pct, "Writing vector data... (" + std::to_string(d) +
+                                     "/" + std::to_string(total) + ")"))
+                    cancelled.store(true, std::memory_order_relaxed);
+            }
+        }
+    });
+
+    ExportLog("vector data done: " + std::to_string(done.load()) + " tiles" +
+              std::string(cancelled.load() ? " (cancelled)" : ""));
+    return !cancelled.load();
 }
 
 // ─── Load roads ────────────────────────────────────────────────────
@@ -1091,8 +1189,11 @@ bool GameExporter::Export(const std::string& outputDir,
 
     // Create output directory
     fs::create_directories(outputDir);
+    ExportLog("started -> " + outputDir +
+              (ar50Path.empty() ? " (no land cover)" : " (AR50 land cover)"));
 
     // Build tile index
+    ExportLog("phase 0: building DTM tile index");
     report(0, "Building DTM tile index...");
     int nTiles = m_profileData.BuildTileIndex(zipPaths, [&](int cur, int tot) -> bool {
         if (progress) {
@@ -1103,47 +1204,75 @@ bool GameExporter::Export(const std::string& outputDir,
         return true;
     });
     if (nTiles == 0) {
+        ExportLog("aborted: no DTM tiles found");
         report(0, "No DTM tiles found");
         return false;
     }
+    ExportLog("indexed " + std::to_string(nTiles) + " DTM tiles");
 
     // Phase 1: collect rail geometry
-    if (!CollectRailGeometry(railwayPath, osmDataPath, progress))
+    ExportLog("phase 1: collecting rail geometry");
+    if (!CollectRailGeometry(railwayPath, osmDataPath, progress)) {
+        ExportLog("phase 1 failed/cancelled");
         return false;
+    }
     if (m_railBBoxes.empty()) {
+        ExportLog("aborted: no rail geometry found");
         report(0, "No rail geometry found");
         return false;
     }
 
     // Phase 2: profile main lines
-    if (!ProfileMainLines(railwayPath, roadsPath, progress))
+    ExportLog("phase 2: profiling main lines");
+    if (!ProfileMainLines(railwayPath, roadsPath, progress)) {
+        ExportLog("phase 2 failed/cancelled");
         return false;
+    }
 
     // Phase 3: profile sidings
-    if (!ProfileSidings(osmDataPath, progress))
+    ExportLog("phase 3: profiling sidings");
+    if (!ProfileSidings(osmDataPath, progress)) {
+        ExportLog("phase 3 failed/cancelled");
         return false;
+    }
 
-    // Load roads within bounds
+    // Phase 4: load roads within bounds
+    ExportLog("phase 4: loading roads");
     report(45, "Loading roads...");
     LoadRoads(roadsPath, m_railBBoxes,
               m_boundsMinX, m_boundsMinY, m_boundsMaxX, m_boundsMaxY,
               m_roads);
+    ExportLog("loaded " + std::to_string(m_roads.size()) + " road segments");
 
-    // Phase 4: generate tile grid
-    if (!GenerateTileGrid(progress))
+    // Phase 5: generate tile grid
+    ExportLog("phase 5: generating tile grid");
+    if (!GenerateTileGrid(progress)) {
+        ExportLog("phase 5 failed/cancelled");
         return false;
+    }
+    ExportLog("tile grid: " + std::to_string(m_tiles.size()) + " tiles");
 
-    // Phase 5: write terrain
-    if (!WriteTerrainTiles(outputDir, progress))
+    // Phase 6: write terrain heightmaps (+ land cover)
+    ExportLog("phase 6: writing terrain tiles");
+    if (!WriteTerrainTiles(outputDir, progress)) {
+        ExportLog("phase 6 failed/cancelled");
         return false;
+    }
 
-    // Phase 6: write vector data
-    if (!WriteVectorData(outputDir, progress))
+    // Phase 7: write vector data
+    ExportLog("phase 7: writing vector data");
+    if (!WriteVectorData(outputDir, progress)) {
+        ExportLog("phase 7 failed/cancelled");
         return false;
+    }
 
-    // Phase 7: write manifest
-    if (!WriteManifest(outputDir, progress))
+    // Phase 8: write manifest
+    ExportLog("phase 8: writing manifest");
+    if (!WriteManifest(outputDir, progress)) {
+        ExportLog("phase 8 failed/cancelled");
         return false;
+    }
 
+    ExportLog("export finished OK");
     return true;
 }

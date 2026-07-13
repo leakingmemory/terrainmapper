@@ -111,6 +111,10 @@ private:
     // Phase 6: clip and write vector data per tile
     bool WriteVectorData(const std::string& outputDir,
                          ProgressCb progress);
+    // Writes one tile's tracks.bin/roads.bin/meta.json. Reads only immutable
+    // geometry, so it is safe to call concurrently across tiles.
+    void WriteOneVectorTile(const ExportTile& tile,
+                            const std::string& outputDir) const;
 
     // Phase 7: write manifest
     bool WriteManifest(const std::string& outputDir,

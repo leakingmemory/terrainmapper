@@ -195,7 +195,7 @@ const CachedTile* ProfileData::LoadTileIntoCache(int tileIdx) const
     }
 
     // Evict LRU if at capacity
-    if (static_cast<int>(m_tileCache.size()) >= kMaxCachedTiles)
+    if (static_cast<int>(m_tileCache.size()) >= m_maxCachedTiles)
         m_tileCache.pop_back();
 
     const auto& entry = m_tileIndex[tileIdx];
@@ -304,6 +304,14 @@ bool ProfileData::SampleElevation(double x25833, double y25833, float& elevOut) 
         return true;
     }
     return false;
+}
+
+ProfileData ProfileData::forThread(int cacheSize) const
+{
+    ProfileData p;
+    p.m_tileIndex = m_tileIndex;   // copy immutable index (cheap metadata only)
+    p.m_maxCachedTiles = cacheSize; // own empty cache, small bound
+    return p;
 }
 
 // ─── Profile building ───────────────────────────────────────────────

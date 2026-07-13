@@ -16,8 +16,10 @@
 #include <cpl_vsi.h>
 
 #include <algorithm>
+#include <chrono>
 #include <ctime>
 #include <functional>
+#include <mutex>
 #include <regex>
 
 enum {
@@ -41,6 +43,7 @@ wxBEGIN_EVENT_TABLE(MainFrame, wxFrame)
     EVT_MENU(wxID_EXIT,        MainFrame::OnExit)
     EVT_MENU(wxID_ABOUT,       MainFrame::OnAbout)
     EVT_LIST_ITEM_ACTIVATED(wxID_ANY, MainFrame::OnTileActivated)
+    EVT_CLOSE(MainFrame::OnClose)
 wxEND_EVENT_TABLE()
 
 MainFrame::MainFrame()
@@ -548,6 +551,11 @@ void MainFrame::CleanupRoadsTemp()
 
 MainFrame::~MainFrame()
 {
+    // Backstop: never destroy while a worker thread is still running.
+    if (m_exportThread.joinable()) {
+        m_exportCancel = true;
+        m_exportThread.join();
+    }
     CleanupAr50Temp();
     CleanupRoadsTemp();
 }
@@ -814,6 +822,12 @@ void MainFrame::OnGameExport(wxCommandEvent&)
         return;
     }
 
+    if (m_exportRunning) {
+        wxMessageBox("An export is already running.", "Game Export",
+                     wxICON_INFORMATION | wxOK, this);
+        return;
+    }
+
     wxDirDialog dlg(this, "Choose export directory", "",
                     wxDD_DEFAULT_STYLE | wxDD_DIR_MUST_EXIST);
     if (dlg.ShowModal() != wxID_OK)
@@ -821,27 +835,108 @@ void MainFrame::OnGameExport(wxCommandEvent&)
 
     std::string outputDir = dlg.GetPath().ToStdString();
 
-    wxProgressDialog prog("Game Export",
-                          "Initializing...",
-                          100, this,
-                          wxPD_APP_MODAL | wxPD_AUTO_HIDE |
-                          wxPD_SMOOTH | wxPD_CAN_ABORT |
-                          wxPD_ELAPSED_TIME | wxPD_REMAINING_TIME);
-    prog.Show();
+    // Heap-allocated: the export runs asynchronously, so the dialog must
+    // outlive this handler. APP_MODAL disables the app's other windows (incl.
+    // MapView) so nothing else touches GDAL while the worker runs.
+    m_exportProgress = new wxProgressDialog(
+        "Game Export", "Initializing...", 100, this,
+        wxPD_APP_MODAL | wxPD_SMOOTH | wxPD_CAN_ABORT |
+        wxPD_ELAPSED_TIME | wxPD_REMAINING_TIME);
+    m_exportProgress->Show();
+
+    m_exportCancel = false;
+    m_exportRunning = true;
+
+    // Copy all inputs — the worker must not read MainFrame members concurrently.
+    m_exportThread = std::thread(&MainFrame::RunExportWorker, this, outputDir,
+                                 m_railwayPath, m_roadsPath, m_osmDataPath,
+                                 m_zipPaths, m_ar50Path);
+}
+
+// Runs on the worker thread. Marshals progress/result to the UI thread.
+void MainFrame::RunExportWorker(std::string outputDir, std::string railwayPath,
+                                std::string roadsPath, std::string osmDataPath,
+                                std::vector<std::string> zipPaths,
+                                std::string ar50Path)
+{
+    // Throttle UI posts. The progress callback may be invoked from several of
+    // the export's own worker threads, so guard the throttle state.
+    std::mutex postMutex;
+    auto lastPost = std::chrono::steady_clock::now();
+    int lastPct = -1;
 
     GameExporter exporter;
-    bool ok = exporter.Export(outputDir, m_railwayPath, m_roadsPath,
-                              m_osmDataPath, m_zipPaths, m_ar50Path,
-                              [&](int pct, const std::string& msg) -> bool {
-                                  return prog.Update(std::min(pct, 99), msg);
-                              });
+    bool ok = exporter.Export(
+        outputDir, railwayPath, roadsPath, osmDataPath, zipPaths, ar50Path,
+        [&](int pct, const std::string& msg) -> bool {
+            if (m_exportCancel.load()) return false;
+            bool post = false;
+            {
+                std::lock_guard<std::mutex> lk(postMutex);
+                auto now = std::chrono::steady_clock::now();
+                if (pct != lastPct ||
+                    now - lastPost >= std::chrono::milliseconds(75)) {
+                    lastPct = pct;
+                    lastPost = now;
+                    post = true;
+                }
+            }
+            if (post) {
+                wxString m = wxString::FromUTF8(msg.c_str());
+                GetEventHandler()->CallAfter(
+                    [this, pct, m] { OnExportProgress(pct, m); });
+            }
+            return !m_exportCancel.load();
+        });
 
-    if (ok)
-        wxMessageBox("Export complete.\n\nOutput: " + outputDir,
-                     "Game Export", wxICON_INFORMATION | wxOK, this);
+    bool cancelled = m_exportCancel.load();
+    wxString out = wxString::FromUTF8(outputDir.c_str());
+    GetEventHandler()->CallAfter(
+        [this, ok, cancelled, out] { OnExportDone(ok, cancelled, out); });
+}
+
+void MainFrame::OnExportProgress(int pct, const wxString& msg)
+{
+    if (!m_exportProgress) return;
+    if (!m_exportProgress->Update(std::min(pct, 99), msg))
+        m_exportCancel = true; // Cancel button → tell the worker to stop
+}
+
+void MainFrame::OnExportDone(bool ok, bool cancelled, const wxString& outputDir)
+{
+    if (!m_exportRunning) return; // already torn down (e.g. window closed)
+
+    if (m_exportThread.joinable()) m_exportThread.join();
+    m_exportRunning = false;
+    if (m_exportProgress) {
+        m_exportProgress->Destroy();
+        m_exportProgress = nullptr;
+    }
+
+    if (cancelled)
+        wxMessageBox("Export cancelled.", "Game Export",
+                     wxICON_INFORMATION | wxOK, this);
+    else if (ok)
+        wxMessageBox("Export complete.\n\nOutput: " + outputDir, "Game Export",
+                     wxICON_INFORMATION | wxOK, this);
     else
-        wxMessageBox("Export failed or was cancelled.",
-                     "Game Export", wxICON_ERROR | wxOK, this);
+        wxMessageBox("Export failed.", "Game Export", wxICON_ERROR | wxOK, this);
+}
+
+void MainFrame::OnClose(wxCloseEvent& event)
+{
+    // Cancel and join a running export before the frame is destroyed, so the
+    // worker never touches a dead MainFrame.
+    if (m_exportRunning) {
+        m_exportCancel = true;
+        if (m_exportThread.joinable()) m_exportThread.join();
+        m_exportRunning = false;
+        if (m_exportProgress) {
+            m_exportProgress->Destroy();
+            m_exportProgress = nullptr;
+        }
+    }
+    event.Skip();
 }
 
 void MainFrame::OnEnrichOsm(wxCommandEvent&)

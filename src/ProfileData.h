@@ -112,6 +112,15 @@ public:
     // Returns false if no tile covers the point
     bool SampleElevation(double x25833, double y25833, float& elevOut) const;
 
+    // The immutable DTM tile index (built by BuildTileIndex).
+    const std::vector<TileIndexEntry>& tileIndex() const { return m_tileIndex; }
+
+    // Make an independent sampler for use on one worker thread: it shares the
+    // (copied, immutable) tile index but has its own empty LRU cache, so
+    // SampleElevation() can run concurrently across instances. `cacheSize`
+    // bounds this instance's cache (keep small — each cell is ~100 MB).
+    ProfileData forThread(int cacheSize) const;
+
     // Parameterized smoothing: Gaussian terrain smoothing + gradient limiting
     // + vertical curve smoothing.  Used by both railway and road profiles.
     static void SmoothWithParams(std::vector<ProfilePoint>& points,
@@ -126,7 +135,7 @@ private:
     // DTM cell is a full float raster (~100 MB). 8 balances memory against
     // reload thrashing when sampling geographically scattered siding tracks.
     mutable std::vector<CachedTile> m_tileCache;
-    static constexpr int kMaxCachedTiles = 8;
+    int m_maxCachedTiles = 8;
 
     // Load a tile's raster data into cache, evicting LRU if needed
     const CachedTile* LoadTileIntoCache(int tileIdx) const;
