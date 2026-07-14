@@ -137,7 +137,15 @@ Per vertex (repeated numVertices times):
 +0      float32   x               easting  (EPSG:25833)
 +4      float32   y               northing (EPSG:25833)
 +8      float32   z               elevation (metres above sea level)
+
+Then, after the vertex block (repeated numVertices times):
++0      uint16    speed           line speed km/h at this vertex
+                                  (0 = unknown; main-line only)
 ```
+
+Speed is matched from OpenStreetMap `maxspeed` on `railway_tracks` (nearest
+vertex within 30 m, non-service ways only) and is piecewise-constant along the
+line. Sidings and yard tracks have no speed data, so every entry is 0.
 
 ### Track types
 

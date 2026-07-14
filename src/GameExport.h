@@ -15,6 +15,7 @@ struct ExportTrack {
     uint8_t  electrified; // 0=no, 1=yes
     std::string lineName; // railway line name (e.g. "Bergensbanen")
     std::vector<float> x, y, z; // EPSG:25833 coordinates
+    std::vector<uint16_t> speed; // per-vertex OSM maxspeed km/h (0=unknown)
 };
 
 // ─── Road segment for export ───────────────────────────────────────
@@ -119,6 +120,10 @@ private:
     // Phase 3: profile sidings from OSM
     bool ProfileSidings(const std::string& osmDataPath,
                         ProgressCb progress);
+
+    // Phase 3b: match OSM maxspeed onto main-line track vertices
+    bool MatchSpeedLimits(const std::string& osmDataPath,
+                          ProgressCb progress);
 
     // Phase 4: generate tile grid
     bool GenerateTileGrid(ProgressCb progress);

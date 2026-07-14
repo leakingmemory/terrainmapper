@@ -16,6 +16,7 @@
 #include <limits>
 #include <mutex>
 #include <set>
+#include <unordered_map>
 #include <filesystem>
 #include <fstream>
 #include <sstream>
@@ -318,6 +319,128 @@ bool GameExporter::CollectRailGeometry(const std::string& railwayPath,
 
     report(4, "Rail geometry collected: " + std::to_string(m_railBBoxes.size()) +
               " segments");
+    return true;
+}
+
+// ─── Phase 3b: Match OSM maxspeed onto main-line track vertices ─────
+//
+// Ports the matching in ProfileView::PopulateSpeedLimits: OSM `railway_tracks`
+// vertices that carry a `maxspeed` (and are not service=siding/yard) are snapped
+// to the nearest main-line track vertex within 30 m. Short unknown gaps between
+// equal speeds are filled. Sidings/yards keep an all-zero (unknown) speed array.
+bool GameExporter::MatchSpeedLimits(const std::string& osmDataPath,
+                                    ProgressCb progress)
+{
+    // Every track gets a speed array sized to its vertices, default 0 = unknown.
+    for (auto& t : m_tracks) t.speed.assign(t.x.size(), 0);
+
+    if (osmDataPath.empty()) return true;
+    auto* ds = static_cast<GDALDataset*>(
+        GDALOpenEx(osmDataPath.c_str(), GDAL_OF_VECTOR | GDAL_OF_READONLY,
+                   nullptr, nullptr, nullptr));
+    if (!ds) return true;
+    OGRLayer* layer = ds->GetLayerByName("railway_tracks");
+    if (!layer) { GDALClose(ds); return true; }
+
+    if (progress) progress(4, "Matching OSM speed limits...");
+
+    OGRSpatialReference wgs84, utm33;
+    wgs84.SetWellKnownGeogCS("WGS84");
+    wgs84.SetAxisMappingStrategy(OAMS_TRADITIONAL_GIS_ORDER);
+    utm33.importFromEPSG(25833);
+    utm33.SetAxisMappingStrategy(OAMS_TRADITIONAL_GIS_ORDER);
+    auto* toUtm = OGRCreateCoordinateTransformation(&wgs84, &utm33);
+
+    // Collect all main-line OSM speed vertices (UTM33) once.
+    struct SpeedPt { double x, y; uint16_t speed; };
+    std::vector<SpeedPt> pts;
+    layer->ResetReading();
+    OGRFeature* feat;
+    while ((feat = layer->GetNextFeature()) != nullptr) {
+        int msIdx = feat->GetFieldIndex("maxspeed");
+        int speed = 0;
+        if (msIdx >= 0 && feat->IsFieldSetAndNotNull(msIdx))
+            speed = feat->GetFieldAsInteger(msIdx);
+        const char* service = feat->GetFieldAsString("service");
+        if (speed <= 0 || (service && service[0])) { // skip unknown / sidings
+            OGRFeature::DestroyFeature(feat);
+            continue;
+        }
+        OGRGeometry* geom = feat->GetGeometryRef();
+        if (geom && toUtm) {
+            OGRGeometry* clone = geom->clone();
+            clone->transform(toUtm);
+            auto addLine = [&](OGRLineString* ls) {
+                for (int p = 0, n = ls->getNumPoints(); p < n; ++p)
+                    pts.push_back({ls->getX(p), ls->getY(p),
+                                   static_cast<uint16_t>(std::min(speed, 65535))});
+            };
+            OGRwkbGeometryType gt = wkbFlatten(clone->getGeometryType());
+            if (gt == wkbLineString)
+                addLine(static_cast<OGRLineString*>(clone));
+            else if (gt == wkbMultiLineString) {
+                auto* m = static_cast<OGRMultiLineString*>(clone);
+                for (int g = 0; g < m->getNumGeometries(); ++g)
+                    addLine(static_cast<OGRLineString*>(m->getGeometryRef(g)));
+            }
+            OGRGeometryFactory::destroyGeometry(clone);
+        }
+        OGRFeature::DestroyFeature(feat);
+    }
+    if (toUtm) OCTDestroyCoordinateTransformation(toUtm);
+    GDALClose(ds);
+    if (pts.empty()) return true;
+
+    // Uniform grid (cell == match radius) over the speed points.
+    constexpr double kMatchRadius = 30.0;
+    auto cellOf = [](double x, double y) {
+        return std::make_pair(static_cast<long>(std::floor(x / kMatchRadius)),
+                              static_cast<long>(std::floor(y / kMatchRadius)));
+    };
+    struct PairHash {
+        size_t operator()(const std::pair<long, long>& p) const {
+            return std::hash<long>()(p.first) * 1000003u ^
+                   std::hash<long>()(p.second);
+        }
+    };
+    std::unordered_map<std::pair<long, long>, std::vector<int>, PairHash> grid;
+    for (int i = 0; i < static_cast<int>(pts.size()); ++i)
+        grid[cellOf(pts[i].x, pts[i].y)].push_back(i);
+
+    const double r2 = kMatchRadius * kMatchRadius;
+    for (auto& t : m_tracks) {
+        if (t.trackType != 0) continue; // main line only
+        // Nearest speed point within radius per vertex.
+        for (size_t k = 0; k < t.x.size(); ++k) {
+            const double vx = t.x[k], vy = t.y[k];
+            const auto c = cellOf(vx, vy);
+            double best = r2;
+            int bestSpeed = 0;
+            for (long dx = -1; dx <= 1; ++dx)
+                for (long dy = -1; dy <= 1; ++dy) {
+                    auto it = grid.find({c.first + dx, c.second + dy});
+                    if (it == grid.end()) continue;
+                    for (int idx : it->second) {
+                        const double ex = pts[idx].x - vx, ey = pts[idx].y - vy;
+                        const double d2 = ex * ex + ey * ey;
+                        if (d2 < best) { best = d2; bestSpeed = pts[idx].speed; }
+                    }
+                }
+            if (bestSpeed > 0) t.speed[k] = static_cast<uint16_t>(bestSpeed);
+        }
+        // Fill short unknown gaps (<=5) bounded by equal known speeds.
+        const int n = static_cast<int>(t.speed.size());
+        for (int i = 0; i < n;) {
+            if (t.speed[i] != 0) { ++i; continue; }
+            int j = i;
+            while (j < n && t.speed[j] == 0) ++j;
+            const uint16_t left = (i > 0) ? t.speed[i - 1] : 0;
+            const uint16_t right = (j < n) ? t.speed[j] : 0;
+            if (j - i <= 5 && left != 0 && left == right)
+                for (int f = i; f < j; ++f) t.speed[f] = left;
+            i = j;
+        }
+    }
     return true;
 }
 
@@ -910,6 +1033,11 @@ static void WriteUint8(std::ofstream& out, uint8_t v)
     out.write(reinterpret_cast<const char*>(&v), 1);
 }
 
+static void WriteUint16(std::ofstream& out, uint16_t v)
+{
+    out.write(reinterpret_cast<const char*>(&v), 2);
+}
+
 static void WriteFloat(std::ofstream& out, float v)
 {
     out.write(reinterpret_cast<const char*>(&v), 4);
@@ -1013,6 +1141,9 @@ void GameExporter::WriteOneVectorTile(const ExportTile& tile,
                     WriteFloat(out, t->y[i]);
                     WriteFloat(out, t->z[i]);
                 }
+                // Per-vertex OSM speed (km/h, 0 = unknown).
+                for (size_t i = 0; i < t->x.size(); i++)
+                    WriteUint16(out, i < t->speed.size() ? t->speed[i] : 0);
             }
         }
 
@@ -1410,6 +1541,10 @@ bool GameExporter::Export(const std::string& outputDir,
         ExportLog("phase 3 failed/cancelled");
         return false;
     }
+
+    // Phase 3b: match OSM speed limits onto main-line tracks
+    ExportLog("phase 3b: matching OSM speed limits");
+    MatchSpeedLimits(osmDataPath, progress);
 
     // Wait for the background roads + tile grid to finish.
     if (bgThread.joinable()) bgThread.join();
