@@ -794,8 +794,7 @@ bool GameExporter::WriteTerrainTiles(const std::string& outputDir,
     const int total = static_cast<int>(m_tiles.size());
 
     // Probe AR50 once to validate the layer and capture the shared EPSG:25833
-    // WKT. Each worker opens its own dataset + transform below (GDAL dataset
-    // handles and OGRCoordinateTransformation are not safe to share).
+    // WKT. Per-worker datasets + transforms are opened (serially) further down.
     std::string wkt25833;
     bool useAr50 = false;
     if (!m_ar50Path.empty()) {
@@ -833,26 +832,39 @@ bool GameExporter::WriteTerrainTiles(const std::string& outputDir,
               std::to_string(nThreads) + " threads" +
               (useAr50 ? " (+ land cover)" : ""));
 
-    RunPool(nThreads, [&](int) {
-        ProfileData sampler = m_profileData.forThread(kThreadCacheSize);
-
-        GDALDataset* ar50 = nullptr;
-        OGRLayer* lcLayer = nullptr;
-        OGRCoordinateTransformation* to4258 = nullptr;
-        if (useAr50) {
-            ar50 = static_cast<GDALDataset*>(GDALOpenEx(
+    // Pre-open one AR50 dataset + transform per worker, SERIALLY, and force the
+    // layer definition to load now. OpenFileGDB is unreliable when the same
+    // .gdb is opened/parsed from several threads at once: that raced the lazy
+    // field-definition load and produced intermittent "Failed to find field
+    // artype" errors, leaving those tiles with no (all-zero) land cover.
+    std::vector<GDALDataset*> ar50DS(nThreads, nullptr);
+    std::vector<OGRLayer*> ar50Layer(nThreads, nullptr);
+    std::vector<OGRCoordinateTransformation*> ar50Tr(nThreads, nullptr);
+    if (useAr50) {
+        for (int t = 0; t < nThreads; ++t) {
+            ar50DS[t] = static_cast<GDALDataset*>(GDALOpenEx(
                 m_ar50Path.c_str(), GDAL_OF_VECTOR | GDAL_OF_READONLY,
                 nullptr, nullptr, nullptr));
-            if (ar50) {
-                lcLayer = ar50->GetLayerByName("ar50");
-                OGRSpatialReference s25833, s4258;
-                s25833.importFromEPSG(25833);
-                s25833.SetAxisMappingStrategy(OAMS_TRADITIONAL_GIS_ORDER);
-                s4258.importFromEPSG(4258);
-                s4258.SetAxisMappingStrategy(OAMS_TRADITIONAL_GIS_ORDER);
-                to4258 = OGRCreateCoordinateTransformation(&s25833, &s4258);
+            if (!ar50DS[t]) continue;
+            ar50Layer[t] = ar50DS[t]->GetLayerByName("ar50");
+            if (ar50Layer[t]) {
+                // Touch the definition now so the field lookup is cached.
+                (void)ar50Layer[t]->GetLayerDefn()->GetFieldIndex("artype");
             }
+            OGRSpatialReference s25833, s4258;
+            s25833.importFromEPSG(25833);
+            s25833.SetAxisMappingStrategy(OAMS_TRADITIONAL_GIS_ORDER);
+            s4258.importFromEPSG(4258);
+            s4258.SetAxisMappingStrategy(OAMS_TRADITIONAL_GIS_ORDER);
+            ar50Tr[t] = OGRCreateCoordinateTransformation(&s25833, &s4258);
         }
+    }
+
+    RunPool(nThreads, [&](int wid) {
+        ProfileData sampler = m_profileData.forThread(kThreadCacheSize);
+        GDALDataset* ar50 = ar50DS[wid];
+        OGRLayer* lcLayer = ar50Layer[wid];
+        OGRCoordinateTransformation* to4258 = ar50Tr[wid];
 
         for (;;) {
             if (cancelled.load(std::memory_order_relaxed)) break;
@@ -874,10 +886,12 @@ bool GameExporter::WriteTerrainTiles(const std::string& outputDir,
                     cancelled.store(true, std::memory_order_relaxed);
             }
         }
-
-        if (to4258) OCTDestroyCoordinateTransformation(to4258);
-        if (ar50) GDALClose(ar50);
     });
+
+    for (int t = 0; t < nThreads; ++t) {
+        if (ar50Tr[t]) OCTDestroyCoordinateTransformation(ar50Tr[t]);
+        if (ar50DS[t]) GDALClose(ar50DS[t]);
+    }
 
     ExportLog("terrain done: " + std::to_string(done.load()) + " tiles" +
               std::string(cancelled.load() ? " (cancelled)" : ""));
