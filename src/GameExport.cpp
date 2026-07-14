@@ -230,7 +230,7 @@ bool GameExporter::CollectRailGeometry(const std::string& railwayPath,
         return !progress || progress(pct, msg);
     };
 
-    report(0, "Collecting rail geometry...");
+    report(1, "Collecting rail geometry...");
 
     // Main lines from GML
     if (!railwayPath.empty()) {
@@ -317,7 +317,7 @@ bool GameExporter::CollectRailGeometry(const std::string& railwayPath,
     m_boundsMaxX += kBuffer;
     m_boundsMaxY += kBuffer;
 
-    report(4, "Rail geometry collected: " + std::to_string(m_railBBoxes.size()) +
+    report(3, "Rail geometry collected: " + std::to_string(m_railBBoxes.size()) +
               " segments");
     return true;
 }
@@ -342,7 +342,7 @@ bool GameExporter::MatchSpeedLimits(const std::string& osmDataPath,
     OGRLayer* layer = ds->GetLayerByName("railway_tracks");
     if (!layer) { GDALClose(ds); return true; }
 
-    if (progress) progress(4, "Matching OSM speed limits...");
+    if (progress) progress(34, "Matching OSM speed limits...");
 
     OGRSpatialReference wgs84, utm33;
     wgs84.SetWellKnownGeogCS("WGS84");
@@ -457,7 +457,7 @@ bool GameExporter::ProfileMainLines(const std::string& railwayPath,
     if (railwayPath.empty()) return true;
 
     auto lineNames = m_profileData.GetLineNames(railwayPath);
-    report(5, "Profiling " + std::to_string(lineNames.size()) + " railway lines...");
+    report(3, "Profiling " + std::to_string(lineNames.size()) + " railway lines...");
 
     int done = 0;
     for (const auto& name : lineNames) {
@@ -524,7 +524,7 @@ bool GameExporter::ProfileMainLines(const std::string& railwayPath,
         }
 
         done++;
-        int pct = 5 + 25 * done / static_cast<int>(lineNames.size());
+        int pct = 3 + 19 * done / static_cast<int>(lineNames.size());
         if (!report(pct, "Profiled " + name + " (" + std::to_string(done) + "/" +
                          std::to_string(lineNames.size()) + ")"))
             return false;
@@ -646,7 +646,7 @@ bool GameExporter::ProfileSidings(const std::string& osmDataPath,
 
         done++;
         if (done % 8 == 0 || done == total) {
-            int pct = 30 + 15 * done / total;
+            int pct = 22 + 12 * done / total;
             if (!report(pct, "Profiling sidings... (" + std::to_string(done) +
                              "/" + std::to_string(total) + ")"))
                 return false;
@@ -659,7 +659,7 @@ bool GameExporter::ProfileSidings(const std::string& osmDataPath,
     // Snap siding endpoints to main-line vertices
     SnapConnections();
 
-    report(45, "Sidings profiled: " + std::to_string(done) + " tracks");
+    report(34, "Sidings profiled: " + std::to_string(done) + " tracks");
     return true;
 }
 
@@ -939,7 +939,7 @@ bool GameExporter::WriteTerrainTiles(const std::string& outputDir,
             GDALClose(probe);
         }
         if (!useAr50)
-            report(50, "AR50 land cover unavailable; skipping landcover.u8");
+            report(35, "AR50 land cover unavailable; skipping landcover.u8");
     }
 
     // Parallel per-tile writing. Tiles are independent (each writes its own
@@ -1003,7 +1003,7 @@ bool GameExporter::WriteTerrainTiles(const std::string& outputDir,
                           std::to_string(total));
             if (d % 16 == 0 || d == total) {
                 std::lock_guard<std::mutex> lk(reportMutex);
-                int pct = 50 + 35 * d / total;
+                int pct = 35 + 54 * d / total;
                 if (!report(pct, "Writing terrain... (" + std::to_string(d) +
                                      "/" + std::to_string(total) + " tiles)"))
                     cancelled.store(true, std::memory_order_relaxed);
@@ -1285,7 +1285,7 @@ bool GameExporter::WriteVectorData(const std::string& outputDir,
             int d = done.fetch_add(1) + 1;
             if (d % 64 == 0 || d == total) {
                 std::lock_guard<std::mutex> lk(reportMutex);
-                int pct = 85 + 8 * d / total;
+                int pct = 89 + 6 * d / total;
                 if (!report(pct, "Writing vector data... (" + std::to_string(d) +
                                      "/" + std::to_string(total) + ")"))
                     cancelled.store(true, std::memory_order_relaxed);
@@ -1478,7 +1478,7 @@ bool GameExporter::Export(const std::string& outputDir,
     int nTiles = m_profileData.BuildTileIndex(zipPaths, [&](int cur, int tot) -> bool {
         if (progress) {
             int pct = tot > 0 ? cur * 100 / tot : 0;
-            return progress(pct / 50, "Indexing DTM tiles... (" +
+            return progress(pct / 100, "Indexing DTM tiles... (" +
                             std::to_string(cur) + "/" + std::to_string(tot) + ")");
         }
         return true;
