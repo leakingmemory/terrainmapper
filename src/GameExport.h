@@ -25,6 +25,14 @@ struct ExportRoad {
     std::vector<float> x, y, z;
 };
 
+// ─── Building for export ───────────────────────────────────────────
+struct ExportBuilding {
+    uint8_t  kind;        // 0=other,1=residential,2=commercial,3=industrial
+    float    baseZ;       // ground elevation (m, sampled from DTM)
+    float    height;      // extrusion height (m)
+    std::vector<float> x, y; // exterior-ring footprint, EPSG:25833
+};
+
 // ─── Station for export ────────────────────────────────────────────
 struct ExportStation {
     std::string name;
@@ -77,6 +85,7 @@ private:
     std::string m_ar50Path;   // AR50 land-cover .gdb path ("" = none)
     std::vector<ExportTrack> m_tracks;
     std::vector<ExportRoad> m_roads;
+    std::vector<ExportBuilding> m_buildings;
     std::vector<ExportStation> m_stations;
     std::vector<TrackConnection> m_connections;
     std::vector<ExportTile> m_tiles;
@@ -102,6 +111,7 @@ private:
     struct BBox2D { float minX, minY, maxX, maxY; };
     std::vector<BBox2D> m_trackBBox;  // parallel to m_tracks
     std::vector<BBox2D> m_roadBBox;   // parallel to m_roads
+    std::vector<BBox2D> m_buildingBBox; // parallel to m_buildings
     double m_gridMinX = 0, m_gridMinY = 0, m_gridCell = 0;
     int m_gridCols = 0, m_gridRows = 0;
     std::vector<std::vector<int>> m_roadGrid; // cell (r*cols+c) -> road indices
@@ -123,6 +133,10 @@ private:
 
     // Phase 3b: match OSM maxspeed onto main-line track vertices
     bool MatchSpeedLimits(const std::string& osmDataPath,
+                          ProgressCb progress);
+
+    // Collect OSM building footprints (+ DTM base elevation) for export.
+    bool CollectBuildings(const std::string& osmDataPath,
                           ProgressCb progress);
 
     // Phase 4: generate tile grid

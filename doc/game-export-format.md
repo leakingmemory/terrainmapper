@@ -221,6 +221,38 @@ Per vertex (repeated numVertices times):
 Road elevation comes from the source GML geometry (3D coordinates from
 the national road register), not from DTM sampling.
 
+## buildings.bin
+
+Binary file containing OSM building footprints that intersect this tile
+(present only when the export had OSM enrichment). Buildings straddling tile
+boundaries appear in full in every tile they touch — dedupe by geometry.
+
+### Layout
+
+```
+Offset  Type      Field
+──────  ────      ─────
+0       uint32    numBuildings
+
+Per building (repeated numBuildings times):
++0      uint8     kind            0=other, 1=residential,
+                                  2=commercial, 3=industrial
++1      uint8[3]  reserved        always 0
++4      float32   baseZ           ground elevation (m, sampled from the DTM)
++8      float32   height          extrusion height (m)
++12     uint32    numVertices     exterior-ring vertex count
+
+Per vertex (repeated numVertices times):
++0      float32   x               easting  (EPSG:25833)
++4      float32   y               northing (EPSG:25833)
+```
+
+The footprint is the polygon exterior ring (holes dropped), **not** closed —
+the final vertex is not a duplicate of the first. Extrude from `baseZ` up to
+`baseZ + height` (flat roof). Height is derived from OSM `building:levels`
+(× ~3 m), defaulting to 2 storeys where untagged. `kind` is classified from
+the `building` tag for colouring.
+
 ## meta.json
 
 Per-tile JSON metadata. Example:

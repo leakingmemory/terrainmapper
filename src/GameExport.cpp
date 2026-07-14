@@ -444,6 +444,129 @@ bool GameExporter::MatchSpeedLimits(const std::string& osmDataPath,
     return true;
 }
 
+// ─── Phase 3c: Collect OSM building footprints ─────────────────────
+//
+// Reads the OSM `buildings` polygon layer (as MapView::LoadBuildings does),
+// transforms exterior rings to EPSG:25833, samples the DTM for a ground base
+// elevation, derives height from `levels` (default 2 storeys), and classifies
+// the `building` tag into a coarse kind for colouring. Runs on the main thread
+// after profiling so it can share m_profileData's DTM sampler safely.
+bool GameExporter::CollectBuildings(const std::string& osmDataPath,
+                                    ProgressCb progress)
+{
+    if (osmDataPath.empty()) return true;
+    auto* ds = static_cast<GDALDataset*>(
+        GDALOpenEx(osmDataPath.c_str(), GDAL_OF_VECTOR | GDAL_OF_READONLY,
+                   nullptr, nullptr, nullptr));
+    if (!ds) return true;
+    OGRLayer* layer = ds->GetLayerByName("buildings");
+    if (!layer) { GDALClose(ds); return true; }
+
+    if (progress) progress(34, "Collecting OSM buildings...");
+
+    OGRSpatialReference wgs84, utm33;
+    wgs84.SetWellKnownGeogCS("WGS84");
+    wgs84.SetAxisMappingStrategy(OAMS_TRADITIONAL_GIS_ORDER);
+    utm33.importFromEPSG(25833);
+    utm33.SetAxisMappingStrategy(OAMS_TRADITIONAL_GIS_ORDER);
+    auto* toUtm = OGRCreateCoordinateTransformation(&wgs84, &utm33);
+
+    // Spatial filter: export bounds (UTM33) transformed back to WGS84.
+    if (auto* toWgs = OGRCreateCoordinateTransformation(&utm33, &wgs84)) {
+        double x1 = m_boundsMinX, y1 = m_boundsMinY;
+        double x2 = m_boundsMaxX, y2 = m_boundsMaxY;
+        toWgs->Transform(1, &x1, &y1);
+        toWgs->Transform(1, &x2, &y2);
+        layer->SetSpatialFilterRect(std::min(x1, x2), std::min(y1, y2),
+                                    std::max(x1, x2), std::max(y1, y2));
+        OCTDestroyCoordinateTransformation(toWgs);
+    }
+
+    auto classify = [](const char* b) -> uint8_t {
+        if (!b || !b[0]) return 0;
+        const std::string s(b);
+        auto in = [&](std::initializer_list<const char*> ks) {
+            for (const char* k : ks) if (s == k) return true;
+            return false;
+        };
+        if (in({"house", "residential", "apartments", "detached", "terrace",
+                "semidetached_house", "bungalow", "cabin", "hut", "dormitory",
+                "houseboat", "farm", "static_caravan"}))
+            return 1;
+        if (in({"commercial", "retail", "office", "hotel", "supermarket",
+                "kiosk", "shop"}))
+            return 2;
+        if (in({"industrial", "warehouse", "factory", "hangar", "manufacture"}))
+            return 3;
+        return 0;
+    };
+
+    auto addRing = [&](OGRLinearRing* ring, uint8_t kind, float height) {
+        if (!ring) return;
+        int n = ring->getNumPoints();
+        if (n >= 2) { // OGR rings are closed (last == first); drop the duplicate
+            if (ring->getX(0) == ring->getX(n - 1) &&
+                ring->getY(0) == ring->getY(n - 1))
+                --n;
+        }
+        if (n < 3) return;
+        ExportBuilding b;
+        b.kind = kind;
+        b.height = height;
+        b.x.reserve(n);
+        b.y.reserve(n);
+        float baseZ = 1e30f;
+        bool anyZ = false;
+        for (int i = 0; i < n; ++i) {
+            b.x.push_back(static_cast<float>(ring->getX(i)));
+            b.y.push_back(static_cast<float>(ring->getY(i)));
+            float e;
+            if (m_profileData.SampleElevation(ring->getX(i), ring->getY(i), e)) {
+                baseZ = std::min(baseZ, e);
+                anyZ = true;
+            }
+        }
+        if (!anyZ) return; // no DTM coverage under the footprint
+        b.baseZ = baseZ;
+        m_buildings.push_back(std::move(b));
+    };
+
+    layer->ResetReading();
+    OGRFeature* feat;
+    while ((feat = layer->GetNextFeature()) != nullptr) {
+        int levels = 0;
+        const int li = feat->GetFieldIndex("levels");
+        if (li >= 0 && feat->IsFieldSetAndNotNull(li))
+            levels = feat->GetFieldAsInteger(li);
+        float height = static_cast<float>(levels > 0 ? levels : 2) * 3.0f;
+        height = std::clamp(height, 3.0f, 180.0f);
+        const uint8_t kind = classify(feat->GetFieldAsString("building"));
+
+        OGRGeometry* geom = feat->GetGeometryRef();
+        if (geom && toUtm) {
+            OGRGeometry* clone = geom->clone();
+            clone->transform(toUtm);
+            const OGRwkbGeometryType gt = wkbFlatten(clone->getGeometryType());
+            if (gt == wkbPolygon)
+                addRing(static_cast<OGRPolygon*>(clone)->getExteriorRing(), kind,
+                        height);
+            else if (gt == wkbMultiPolygon) {
+                auto* mp = static_cast<OGRMultiPolygon*>(clone);
+                for (int g = 0; g < mp->getNumGeometries(); ++g)
+                    addRing(static_cast<OGRPolygon*>(mp->getGeometryRef(g))
+                                ->getExteriorRing(),
+                            kind, height);
+            }
+            OGRGeometryFactory::destroyGeometry(clone);
+        }
+        OGRFeature::DestroyFeature(feat);
+    }
+    if (toUtm) OCTDestroyCoordinateTransformation(toUtm);
+    GDALClose(ds);
+    ExportLog("collected " + std::to_string(m_buildings.size()) + " buildings");
+    return true;
+}
+
 // ─── Phase 2: Profile all main lines ───────────────────────────────
 
 bool GameExporter::ProfileMainLines(const std::string& railwayPath,
@@ -1065,6 +1188,9 @@ void GameExporter::BuildVectorIndex()
     m_roadBBox.resize(m_roads.size());
     for (size_t i = 0; i < m_roads.size(); ++i)
         m_roadBBox[i] = boundsOf(m_roads[i].x, m_roads[i].y);
+    m_buildingBBox.resize(m_buildings.size());
+    for (size_t i = 0; i < m_buildings.size(); ++i)
+        m_buildingBBox[i] = boundsOf(m_buildings[i].x, m_buildings[i].y);
 
     // Uniform grid over the export bounds indexing roads by cell.
     m_roadGrid.clear();
@@ -1194,6 +1320,33 @@ void GameExporter::WriteOneVectorTile(const ExportTile& tile,
             }
         }
 
+        // Find buildings intersecting this tile (flat bbox scan; far fewer than
+        // roads) and write buildings.bin.
+        std::vector<const ExportBuilding*> tileBuildings;
+        for (size_t i = 0; i < m_buildings.size(); i++) {
+            const BBox2D& bb = m_buildingBBox[i];
+            if (bb.minX < tMaxX && bb.maxX > tile.originX &&
+                bb.minY < tMaxY && bb.maxY > tile.originY)
+                tileBuildings.push_back(&m_buildings[i]);
+        }
+        {
+            std::ofstream out(tileDir + "/buildings.bin", std::ios::binary);
+            WriteUint32(out, static_cast<uint32_t>(tileBuildings.size()));
+            for (const auto* b : tileBuildings) {
+                WriteUint8(out, b->kind);
+                WriteUint8(out, 0);
+                WriteUint8(out, 0);
+                WriteUint8(out, 0);
+                WriteFloat(out, b->baseZ);
+                WriteFloat(out, b->height);
+                WriteUint32(out, static_cast<uint32_t>(b->x.size()));
+                for (size_t i = 0; i < b->x.size(); i++) {
+                    WriteFloat(out, b->x[i]);
+                    WriteFloat(out, b->y[i]);
+                }
+            }
+        }
+
         // Find stations in this tile
         std::vector<const ExportStation*> tileStations;
         for (const auto& s : m_stations) {
@@ -1224,6 +1377,7 @@ void GameExporter::WriteOneVectorTile(const ExportTile& tile,
             out << "  \"pixels\": 256,\n";
             out << "  \"trackSegments\": " << tileTracks.size() << ",\n";
             out << "  \"roadSegments\": " << tileRoads.size() << ",\n";
+            out << "  \"buildingSegments\": " << tileBuildings.size() << ",\n";
 
             // Stations
             out << "  \"stations\": [";
@@ -1545,6 +1699,11 @@ bool GameExporter::Export(const std::string& outputDir,
     // Phase 3b: match OSM speed limits onto main-line tracks
     ExportLog("phase 3b: matching OSM speed limits");
     MatchSpeedLimits(osmDataPath, progress);
+
+    // Phase 3c: collect OSM buildings (main thread — shares m_profileData's DTM
+    // sampler with profiling, which has finished).
+    ExportLog("phase 3c: collecting OSM buildings");
+    CollectBuildings(osmDataPath, progress);
 
     // Wait for the background roads + tile grid to finish.
     if (bgThread.joinable()) bgThread.join();
