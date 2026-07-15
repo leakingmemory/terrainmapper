@@ -28,8 +28,9 @@ struct ExportRoad {
 // ─── Building for export ───────────────────────────────────────────
 struct ExportBuilding {
     uint8_t  kind;        // 0=other,1=residential,2=commercial,3=industrial
+    uint8_t  roof;        // 0=flat,1=gabled,2=hipped,3=pyramidal,4=skillion
     float    baseZ;       // ground elevation (m, sampled from DTM)
-    float    height;      // extrusion height (m)
+    float    height;      // wall/eaves height (m)
     std::vector<float> x, y; // exterior-ring footprint, EPSG:25833
 };
 

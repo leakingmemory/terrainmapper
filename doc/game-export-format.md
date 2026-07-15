@@ -237,9 +237,11 @@ Offset  Type      Field
 Per building (repeated numBuildings times):
 +0      uint8     kind            0=other, 1=residential,
                                   2=commercial, 3=industrial
-+1      uint8[3]  reserved        always 0
++1      uint8     roof            roof shape: 0=flat, 1=gabled, 2=hipped,
+                                  3=pyramidal, 4=skillion (from OSM roof_shape)
++2      uint8[2]  reserved        always 0
 +4      float32   baseZ           ground elevation (m, sampled from the DTM)
-+8      float32   height          extrusion height (m)
++8      float32   height          wall/eaves height (m); pitched roofs rise above
 +12     uint32    numVertices     exterior-ring vertex count
 
 Per vertex (repeated numVertices times):

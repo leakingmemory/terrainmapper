@@ -501,7 +501,22 @@ bool GameExporter::CollectBuildings(const std::string& osmDataPath,
         return 0;
     };
 
-    auto addRing = [&](OGRLinearRing* ring, uint8_t kind, float height) {
+    auto classifyRoof = [](const char* r) -> uint8_t {
+        if (!r || !r[0]) return 0; // flat / untagged
+        const std::string s(r);
+        auto in = [&](std::initializer_list<const char*> ks) {
+            for (const char* k : ks) if (s == k) return true;
+            return false;
+        };
+        if (in({"gabled", "gambrel", "saltbox", "round"})) return 1;
+        if (in({"hipped", "half-hipped", "mansard"})) return 2;
+        if (in({"pyramidal", "dome", "onion", "cone", "conical"})) return 3;
+        if (in({"skillion", "lean_to", "mono_pitch", "monopitch"})) return 4;
+        return 0;
+    };
+
+    auto addRing = [&](OGRLinearRing* ring, uint8_t kind, uint8_t roof,
+                       float height) {
         if (!ring) return;
         int n = ring->getNumPoints();
         if (n >= 2) { // OGR rings are closed (last == first); drop the duplicate
@@ -512,6 +527,7 @@ bool GameExporter::CollectBuildings(const std::string& osmDataPath,
         if (n < 3) return;
         ExportBuilding b;
         b.kind = kind;
+        b.roof = roof;
         b.height = height;
         b.x.reserve(n);
         b.y.reserve(n);
@@ -541,6 +557,7 @@ bool GameExporter::CollectBuildings(const std::string& osmDataPath,
         float height = static_cast<float>(levels > 0 ? levels : 2) * 3.0f;
         height = std::clamp(height, 3.0f, 180.0f);
         const uint8_t kind = classify(feat->GetFieldAsString("building"));
+        const uint8_t roof = classifyRoof(feat->GetFieldAsString("roof_shape"));
 
         OGRGeometry* geom = feat->GetGeometryRef();
         if (geom && toUtm) {
@@ -549,13 +566,13 @@ bool GameExporter::CollectBuildings(const std::string& osmDataPath,
             const OGRwkbGeometryType gt = wkbFlatten(clone->getGeometryType());
             if (gt == wkbPolygon)
                 addRing(static_cast<OGRPolygon*>(clone)->getExteriorRing(), kind,
-                        height);
+                        roof, height);
             else if (gt == wkbMultiPolygon) {
                 auto* mp = static_cast<OGRMultiPolygon*>(clone);
                 for (int g = 0; g < mp->getNumGeometries(); ++g)
                     addRing(static_cast<OGRPolygon*>(mp->getGeometryRef(g))
                                 ->getExteriorRing(),
-                            kind, height);
+                            kind, roof, height);
             }
             OGRGeometryFactory::destroyGeometry(clone);
         }
@@ -1334,7 +1351,7 @@ void GameExporter::WriteOneVectorTile(const ExportTile& tile,
             WriteUint32(out, static_cast<uint32_t>(tileBuildings.size()));
             for (const auto* b : tileBuildings) {
                 WriteUint8(out, b->kind);
-                WriteUint8(out, 0);
+                WriteUint8(out, b->roof); // reserved[0] = roof shape
                 WriteUint8(out, 0);
                 WriteUint8(out, 0);
                 WriteFloat(out, b->baseZ);
