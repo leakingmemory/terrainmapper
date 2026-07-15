@@ -584,6 +584,109 @@ bool GameExporter::CollectBuildings(const std::string& osmDataPath,
     return true;
 }
 
+bool GameExporter::CollectPlatforms(const std::string& osmDataPath,
+                                    ProgressCb progress)
+{
+    if (osmDataPath.empty()) return true;
+    auto* ds = static_cast<GDALDataset*>(
+        GDALOpenEx(osmDataPath.c_str(), GDAL_OF_VECTOR | GDAL_OF_READONLY,
+                   nullptr, nullptr, nullptr));
+    if (!ds) return true;
+    OGRLayer* layer = ds->GetLayerByName("railway_platforms");
+    if (!layer) { GDALClose(ds); return true; }
+
+    if (progress) progress(34, "Collecting OSM platforms...");
+
+    OGRSpatialReference wgs84, utm33;
+    wgs84.SetWellKnownGeogCS("WGS84");
+    wgs84.SetAxisMappingStrategy(OAMS_TRADITIONAL_GIS_ORDER);
+    utm33.importFromEPSG(25833);
+    utm33.SetAxisMappingStrategy(OAMS_TRADITIONAL_GIS_ORDER);
+    auto* toUtm = OGRCreateCoordinateTransformation(&wgs84, &utm33);
+
+    // Spatial filter: export bounds (UTM33) transformed back to WGS84.
+    if (auto* toWgs = OGRCreateCoordinateTransformation(&utm33, &wgs84)) {
+        double x1 = m_boundsMinX, y1 = m_boundsMinY;
+        double x2 = m_boundsMaxX, y2 = m_boundsMaxY;
+        toWgs->Transform(1, &x1, &y1);
+        toWgs->Transform(1, &x2, &y2);
+        layer->SetSpatialFilterRect(std::min(x1, x2), std::min(y1, y2),
+                                    std::max(x1, x2), std::max(y1, y2));
+        OCTDestroyCoordinateTransformation(toWgs);
+    }
+
+    const float kPlatformHeight = 0.55f; // low concrete slab (m)
+
+    auto addRing = [&](OGRLinearRing* ring) {
+        if (!ring) return;
+        int n = ring->getNumPoints();
+        if (n >= 2) { // OGR rings are closed (last == first); drop the duplicate
+            if (ring->getX(0) == ring->getX(n - 1) &&
+                ring->getY(0) == ring->getY(n - 1))
+                --n;
+        }
+        if (n < 3) return;
+        ExportPlatform p;
+        p.height = kPlatformHeight;
+        p.x.reserve(n);
+        p.y.reserve(n);
+        float baseZ = 1e30f;
+        bool anyZ = false;
+        for (int i = 0; i < n; ++i) {
+            p.x.push_back(static_cast<float>(ring->getX(i)));
+            p.y.push_back(static_cast<float>(ring->getY(i)));
+            float e;
+            if (m_profileData.SampleElevation(ring->getX(i), ring->getY(i), e)) {
+                baseZ = std::min(baseZ, e);
+                anyZ = true;
+            }
+        }
+        if (!anyZ) return; // no DTM coverage under the footprint
+        p.baseZ = baseZ;
+        m_platforms.push_back(std::move(p));
+    };
+
+    // Handle a (possibly multi-)polygon geometry by adding each exterior ring.
+    std::function<void(OGRGeometry*)> addPoly = [&](OGRGeometry* g) {
+        if (!g) return;
+        const OGRwkbGeometryType gt = wkbFlatten(g->getGeometryType());
+        if (gt == wkbPolygon)
+            addRing(static_cast<OGRPolygon*>(g)->getExteriorRing());
+        else if (gt == wkbMultiPolygon) {
+            auto* mp = static_cast<OGRMultiPolygon*>(g);
+            for (int i = 0; i < mp->getNumGeometries(); ++i)
+                addRing(static_cast<OGRPolygon*>(mp->getGeometryRef(i))
+                            ->getExteriorRing());
+        }
+    };
+
+    layer->ResetReading();
+    OGRFeature* feat;
+    while ((feat = layer->GetNextFeature()) != nullptr) {
+        OGRGeometry* geom = feat->GetGeometryRef();
+        if (geom && toUtm) {
+            OGRGeometry* clone = geom->clone();
+            clone->transform(toUtm);
+            const OGRwkbGeometryType gt = wkbFlatten(clone->getGeometryType());
+            if (gt == wkbPolygon || gt == wkbMultiPolygon) {
+                addPoly(clone);
+            } else if (gt == wkbLineString || gt == wkbMultiLineString) {
+                // Platform edges are lines; buffer into a ~3 m strip (GEOS).
+                if (OGRGeometry* buf = clone->Buffer(1.5, 8)) {
+                    addPoly(buf);
+                    OGRGeometryFactory::destroyGeometry(buf);
+                }
+            }
+            OGRGeometryFactory::destroyGeometry(clone);
+        }
+        OGRFeature::DestroyFeature(feat);
+    }
+    if (toUtm) OCTDestroyCoordinateTransformation(toUtm);
+    GDALClose(ds);
+    ExportLog("collected " + std::to_string(m_platforms.size()) + " platforms");
+    return true;
+}
+
 // ─── Phase 2: Profile all main lines ───────────────────────────────
 
 bool GameExporter::ProfileMainLines(const std::string& railwayPath,
@@ -1208,6 +1311,9 @@ void GameExporter::BuildVectorIndex()
     m_buildingBBox.resize(m_buildings.size());
     for (size_t i = 0; i < m_buildings.size(); ++i)
         m_buildingBBox[i] = boundsOf(m_buildings[i].x, m_buildings[i].y);
+    m_platformBBox.resize(m_platforms.size());
+    for (size_t i = 0; i < m_platforms.size(); ++i)
+        m_platformBBox[i] = boundsOf(m_platforms[i].x, m_platforms[i].y);
 
     // Uniform grid over the export bounds indexing roads by cell.
     m_roadGrid.clear();
@@ -1364,6 +1470,29 @@ void GameExporter::WriteOneVectorTile(const ExportTile& tile,
             }
         }
 
+        // Find platforms intersecting this tile (flat bbox scan) and write
+        // platforms.bin.
+        std::vector<const ExportPlatform*> tilePlatforms;
+        for (size_t i = 0; i < m_platforms.size(); i++) {
+            const BBox2D& bb = m_platformBBox[i];
+            if (bb.minX < tMaxX && bb.maxX > tile.originX &&
+                bb.minY < tMaxY && bb.maxY > tile.originY)
+                tilePlatforms.push_back(&m_platforms[i]);
+        }
+        {
+            std::ofstream out(tileDir + "/platforms.bin", std::ios::binary);
+            WriteUint32(out, static_cast<uint32_t>(tilePlatforms.size()));
+            for (const auto* p : tilePlatforms) {
+                WriteFloat(out, p->baseZ);
+                WriteFloat(out, p->height);
+                WriteUint32(out, static_cast<uint32_t>(p->x.size()));
+                for (size_t i = 0; i < p->x.size(); i++) {
+                    WriteFloat(out, p->x[i]);
+                    WriteFloat(out, p->y[i]);
+                }
+            }
+        }
+
         // Find stations in this tile
         std::vector<const ExportStation*> tileStations;
         for (const auto& s : m_stations) {
@@ -1395,6 +1524,7 @@ void GameExporter::WriteOneVectorTile(const ExportTile& tile,
             out << "  \"trackSegments\": " << tileTracks.size() << ",\n";
             out << "  \"roadSegments\": " << tileRoads.size() << ",\n";
             out << "  \"buildingSegments\": " << tileBuildings.size() << ",\n";
+            out << "  \"platformSegments\": " << tilePlatforms.size() << ",\n";
 
             // Stations
             out << "  \"stations\": [";
@@ -1721,6 +1851,11 @@ bool GameExporter::Export(const std::string& outputDir,
     // sampler with profiling, which has finished).
     ExportLog("phase 3c: collecting OSM buildings");
     CollectBuildings(osmDataPath, progress);
+
+    // Phase 3d: collect OSM station platforms (main thread — shares
+    // m_profileData's DTM sampler, as above).
+    ExportLog("phase 3d: collecting OSM platforms");
+    CollectPlatforms(osmDataPath, progress);
 
     // Wait for the background roads + tile grid to finish.
     if (bgThread.joinable()) bgThread.join();

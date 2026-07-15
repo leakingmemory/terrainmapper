@@ -255,6 +255,37 @@ the final vertex is not a duplicate of the first. Extrude from `baseZ` up to
 (× ~3 m), defaulting to 2 storeys where untagged. `kind` is classified from
 the `building` tag for colouring.
 
+## platforms.bin
+
+Binary file containing OSM station-platform footprints that intersect this tile
+(present only when the export had OSM enrichment). Sourced from the
+`railway=platform` / `platform_edge` features. Area platforms come from their
+polygon footprint; platform-edge *lines* are buffered into a ~3 m-wide strip
+before export. As with buildings, platforms straddling tile boundaries appear in
+full in every tile they touch — dedupe by geometry.
+
+### Layout
+
+```
+Offset  Type      Field
+──────  ────      ─────
+0       uint32    numPlatforms
+
+Per platform (repeated numPlatforms times):
++0      float32   baseZ           ground elevation (m, sampled from the DTM)
++4      float32   height          slab height (m); low concrete platform
++8      uint32    numVertices     exterior-ring vertex count
+
+Per vertex (repeated numVertices times):
++0      float32   x               easting  (EPSG:25833)
++4      float32   y               northing (EPSG:25833)
+```
+
+The footprint is the polygon exterior ring (holes dropped), **not** closed —
+the final vertex is not a duplicate of the first. Extrude from `baseZ` up to
+`baseZ + height` as a flat concrete slab. `height` is a fixed platform height
+(~0.55 m).
+
 ## meta.json
 
 Per-tile JSON metadata. Example:
@@ -307,6 +338,8 @@ Per-tile JSON metadata. Example:
 | pixels         | int     | Heightmap dimension (always 256) |
 | trackSegments  | int     | Number of track segments in tracks.bin |
 | roadSegments   | int     | Number of road segments in roads.bin |
+| buildingSegments | int   | Number of buildings in buildings.bin |
+| platformSegments | int   | Number of platforms in platforms.bin |
 | stations       | array   | Railway stations within this tile |
 | connections    | array   | Track-to-track connection points (switches) |
 

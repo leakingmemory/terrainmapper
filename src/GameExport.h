@@ -34,6 +34,13 @@ struct ExportBuilding {
     std::vector<float> x, y; // exterior-ring footprint, EPSG:25833
 };
 
+// ─── Station platform for export ───────────────────────────────────
+struct ExportPlatform {
+    float baseZ;         // ground elevation (m, sampled from DTM)
+    float height;        // platform slab height (m)
+    std::vector<float> x, y; // exterior-ring footprint, EPSG:25833
+};
+
 // ─── Station for export ────────────────────────────────────────────
 struct ExportStation {
     std::string name;
@@ -87,6 +94,7 @@ private:
     std::vector<ExportTrack> m_tracks;
     std::vector<ExportRoad> m_roads;
     std::vector<ExportBuilding> m_buildings;
+    std::vector<ExportPlatform> m_platforms;
     std::vector<ExportStation> m_stations;
     std::vector<TrackConnection> m_connections;
     std::vector<ExportTile> m_tiles;
@@ -113,6 +121,7 @@ private:
     std::vector<BBox2D> m_trackBBox;  // parallel to m_tracks
     std::vector<BBox2D> m_roadBBox;   // parallel to m_roads
     std::vector<BBox2D> m_buildingBBox; // parallel to m_buildings
+    std::vector<BBox2D> m_platformBBox; // parallel to m_platforms
     double m_gridMinX = 0, m_gridMinY = 0, m_gridCell = 0;
     int m_gridCols = 0, m_gridRows = 0;
     std::vector<std::vector<int>> m_roadGrid; // cell (r*cols+c) -> road indices
@@ -138,6 +147,10 @@ private:
 
     // Collect OSM building footprints (+ DTM base elevation) for export.
     bool CollectBuildings(const std::string& osmDataPath,
+                          ProgressCb progress);
+
+    // Collect OSM station platform footprints (+ DTM base elevation).
+    bool CollectPlatforms(const std::string& osmDataPath,
                           ProgressCb progress);
 
     // Phase 4: generate tile grid
